@@ -1,0 +1,57 @@
+/*
+  Experimental hidden-feedback compaction.
+
+  Facebook keeps ownership of the outer virtualized feed unit and all React
+  nodes remain connected. The pending marker collapses a post immediately
+  before Faceberg invokes Facebook's native Hide control; a MutationObserver
+  then converts it to the confirmed marker or restores it on failure. The
+  late-sponsored marker uses the same inner-root boundary without invoking
+  native Hide when slow hydration has already made the card visible.
+*/
+[data-faceberg-pending-native-hide],
+[data-faceberg-late-sponsored],
+[data-faceberg-compact-hidden-feedback] {
+  block-size: 1px !important;
+  min-block-size: 0 !important;
+  max-block-size: 1px !important;
+  height: 1px !important;
+  min-height: 0 !important;
+  max-height: 1px !important;
+  box-sizing: border-box !important;
+  margin-block: 0 !important;
+  padding-block: 0 !important;
+  border: 0 !important;
+  overflow: hidden !important;
+  overflow: clip !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  contain: layout paint style !important;
+}
+
+[data-faceberg-pending-native-hide],
+[data-faceberg-pending-native-hide] *,
+[data-faceberg-late-sponsored],
+[data-faceberg-late-sponsored] *,
+[data-faceberg-compact-hidden-feedback],
+[data-faceberg-compact-hidden-feedback] * {
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+/*
+  Standalone Stories and Reels modules stay connected to Facebook's React tree,
+  but their verified module root is removed from layout. This avoids the event
+  ownership and recycled-target failures caused by removing feed DOM nodes.
+*/
+[data-faceberg-hidden-feed-module] {
+  display: none !important;
+}
+
+/*
+  Sponsored items in the full-screen Reel viewer are marked only after Faceberg
+  has resolved one exact one-video Reel boundary. Keeping the item connected
+  lets Facebook retain ownership of its scroll-snap list and recycled nodes.
+*/
+[data-faceberg-hidden-sponsored-reel] {
+  display: none !important;
+}

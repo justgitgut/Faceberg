@@ -33,6 +33,7 @@ The intended order is:
 - A topmost media viewer without visible comment UI is a hard stop. Do not fall back to an older dialog underneath it.
 - A feed photo/lightbox can rewrite the page URL to `/photo/` before inline comments exist. That URL change alone must not trigger document-level direct-page automation.
 - A notifications click can also rewrite the URL before Facebook finishes replacing the old feed DOM. That transition must not allow any feed, dialog, or direct-page automation to act on stale surfaces.
+- Facebook may render the active modal post's own timestamp/story links as query-only hrefs while comment permalinks use a different canonical post ID. Treat an exact resolved self link as route evidence only inside the deepest `aria-modal="true"` post dialog; never use query-only links from the mounted Home feed to validate a direct-post surface.
 - Do not treat Reels surfaces as direct post surfaces even if the URL contains `/reel/`.
 - Reel automation must first identify one active reel context with visible reel media, then resolve comment controls only inside that context or its adjacent comment panel.
 - If multiple reel candidates remain close in score, abort instead of guessing.
@@ -40,6 +41,12 @@ The intended order is:
 ## Dialog Rules
 
 - Do not assume the first visible dialog is the correct post dialog.
+- Facebook may nest a full-screen dialog shell around the real `aria-modal` post. Canonicalize that structure to the deepest visible modal before creating automation state.
+- Facebook renders one close control inside the modal and another in the
+  surrounding page header. Treat either trusted pointer-down as the beginning
+  of dialog teardown, suspend every comment automation continuation, and resume
+  only after the exact modal disconnects or a different route-matching surface
+  is resolved.
 - A dialog is automatable only when it is:
   - a real post dialog with post signals, or
   - a media viewer dialog that already exposes comment UI
@@ -48,27 +55,78 @@ The intended order is:
 ## Filter Rules
 
 - The filter must be switched before reply expansion is attempted.
-- Sorter opening is dispatch-first: the opener sends one click attempt to the resolved toggle target, then a short delayed follow-up verifies whether the popup actually opened.
-- The delayed follow-up only acts when the toggle reads open (`aria-expanded="true"`). If Facebook never flips that state, the sorter will not be retried aggressively.
+- If the resolved sorter is outside the viewport inside a scrollable dialog, snapshot the relevant scroll containers and reveal it before activation.
+- Sorter opening asks the narrowly scoped MAIN-world bridge to invoke the
+  resolved toggle's React callback and falls back to one native DOM click only
+  when that handler is unavailable. Popup and selection verification run from
+  the resulting DOM/ARIA mutations without polling or animation-frame delay.
+- The bridge may resolve `onClick`/`onPress` from the exact host node's `__reactProps$`, `__reactEventHandlers$`, or host Fiber. Fiber traversal must stop before entering a different host DOM element so an ancestor dialog/post handler can never be mistaken for the sorter action.
+- Popup detection is authoritative because Facebook does not always update `aria-expanded`.
+- Restore the captured dialog scroll position after selection succeeds, fails, or times out.
 - Menu item selection should stay narrowly targeted to the active popup.
+- The `All comments` action must target the popup's explicit interactive row
+  (`menuitem`, `menuitemradio`, `option`, or `radio`), never a descendant label
+  that can absorb a no-op click. Its current Facebook callback is
+  zero-argument; do not pass a hand-built React event object into it.
+- Resolve the exact interactive row, then ask the narrowly scoped MAIN-world
+  bridge to invoke that row's own React `onClick`/`onPress` handler. The bridge
+  accepts only a visible `All comments` row inside Facebook's `Comment Ordering`
+  menu; it never performs selector-wide page actions or keyboard activation.
 - Popup resolution must stay anchored to the active sorter toggle; visible menus elsewhere on the page are not valid fallbacks.
-- Facebook can replace the sorter popup node while the menu is hydrating. Watchers must re-resolve the active popup instead of holding onto the first node they saw.
-- Feed dialogs can select immediately from an already-open loaded popup, while direct post and media surfaces may need a short loading watcher when Facebook shows a spinner first.
-- Any filter-change stat increment must receive the runtime `deps` object through both the immediate-selection and delayed-retry paths; otherwise the UI can switch correctly while the counter stays at zero.
+- Facebook can replace the sorter popup node while the menu is hydrating.
+  Watchers must re-resolve the active popup instead of holding onto the first
+  node they saw. A unique visible
+  `role="menu" aria-label="Comment Ordering"` is authoritative even when a
+  slow Chromium variant positions it outside the normal proximity envelope.
+- Feed dialogs can select immediately from an already-open loaded popup, while
+  direct post and media surfaces use a MutationObserver when Facebook shows a
+  spinner first.
+- Do not increment `Filter changes` when a click is merely dispatched; wait
+  until the sorter text confirms `All comments`.
+- Treat popup dismissal as part of successful selection. If a popup remains visible after confirmation or failure, close it immediately through the anchored toggle instead of reactivating a menu row or scheduling another delayed fallback.
+- If selection is not confirmed, retry the exact row at most once, close the
+  popup, restore scroll, and yield until a later automation wake instead of
+  leaving the menu open or looping. The attempt count is structural and must
+  never reset merely because Vivaldi delayed mutation delivery.
+- Any filter-change stat increment must receive the runtime `deps` object
+  through both immediate selection and mutation-driven verification; otherwise
+  the UI can switch correctly while the counter stays at zero.
 
 ## Expansion Rules
 
 - Expansion should target summary/load-more/reply controls only.
 - Do not auto-click broad primary comment openers from the feed.
-- Reply expansion often requires a follow-up pass after the filter switch settles.
-- Exact `View all N replies` labels should be treated as reply-summary controls even when Facebook changes surrounding wrappers.
+- Reply expansion reacts to the DOM mutation produced by the filter switch or
+  preceding reply activation.
+- Exact `View N replies`, `View all N replies`, and answer-labelled variants should be treated as reply-summary controls even when Facebook changes surrounding wrappers.
+- A reply summary may sit beside its owning `Comment by ...` or `Reply by ...` article without a semantic list wrapper. That single-comment structural relationship is sufficient; a post-level comment count is not.
+- Multiple reply groups expand serially, one activation per observed DOM
+  change, with a per-surface attempt cap rather than elapsed-time cooldowns.
+- Activate only the exact native reply/load-more button. Never click a guessed label descendant or clickable ancestor because either can inherit a post permalink.
+- After all structure and route guards pass, activate the exact native `View N
+  replies` button with one DOM click; never dispatch a duplicate synthetic
+  pointer/keyboard sequence.
+- Treat an exact `See more` as comment-text expansion only when it is a native button inside a verified `Comment by …` or `Reply by …` article, its local text wrapper ends in an ellipsis plus `See more`, and it has no link or menu ancestor. This includes Reel comment sidebars while excluding Reel captions and post bodies.
+- Bind every mutation-driven continuation to the unchanged URL and connected
+  dialog, and ignore unavailable-content dialogs even when their failed shell
+  contains a comment composer.
 - Direct permalink dialogs can auto-focus the empty comment composer (`Comment as ...`) without any user input. That empty focused composer must not suppress reply expansion; only real typed composer content should block automation.
 
 ## Watcher Rules
 
 - Mutation watchers are necessary because sorting and expansion render asynchronously.
-- The main expansion follow-up still reruns from `document`, so stale-surface regressions remain a risk when dialog resolution broadens.
+- Follow-up expansion watchers rerun against the same connected visible canonical surface, not the whole document.
 - When a newly added dialog appears, rerun automation from that dialog root first.
+- Facebook SPA permalink changes are not guaranteed to emit `popstate`,
+  `hashchange`, or `Navigation.currententrychange` in the content-script world.
+  Wake comment automation from both the MAIN-world history bridge and the
+  background tab URL event, with a constant-time URL comparison on DOM mutation
+  as a fallback.
+- A permalink commit can precede replacement of the old post dialog. Keep only
+  that exact destination URL armed until `getVisiblePostDialog()` resolves a
+  route-matching surface; rejecting the stale dialog is not completion. During
+  this transition, inspect only the canonical dialog resolver and never scan
+  mutation records or feed nodes.
 
 ## Notification Navigation Rules
 
@@ -81,6 +139,8 @@ The intended order is:
 - Avoid `document`-level fallback into feed surfaces for comment automation.
 - Avoid falling back from a topmost media viewer into older dialogs.
 - Avoid counting menu-item activation success before the actual `All comments` row is clicked.
+- Avoid assuming CSS visibility means the sorter is inside the viewport.
+- Avoid multiple activation mechanisms in one attempt; duplicate native, synthetic, and keyboard dispatch can toggle menus twice. Bounded retries must repeat the same exact-row page-world handler action.
 - Avoid anchoring sorter-menu follow-up logic to a popup node that Facebook is free to replace during loading.
 - Avoid changing dialog resolution heuristics without rerunning the full regression checklist.
 - Avoid removing the comments that explain why feed/document fallbacks are restricted.
@@ -98,7 +158,8 @@ After touching comment automation, verify all of the following:
 7. A feed photo that rewrites the URL to `/photo/` does not trigger random post/dialog reopen behavior before inline comments appear.
 8. On a `/reel/` or Reels route, comment automation resolves only the active reel surface and does not reopen a stale post dialog.
 9. If the active reel surface is ambiguous, comment automation does nothing.
-10. `Filter changes` increments only when the sorter actually transitions to `All comments`.
+10. `Filter changes` increments only when the sorter actually transitions to
+    `All comments`.
 11. Opening notifications does not cause random posts, stacked post dialogs, or parent group feeds to open.
 12. If the same notification is opened repeatedly, the first click behaves the same as later clicks; there is no stale-first-click misfire.
 13. A direct post or media sorter that first opens with a spinner settles onto the same active popup and selects `All comments` without flickering.

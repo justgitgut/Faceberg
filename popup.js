@@ -11,11 +11,17 @@
     enableAntiRefresh: false,
     enableFeedFilter: true,
     enablePostExpansion: true,
+    enableCommentSortAll: true,
     enableCommentExpansion: true,
+    enableBlockSponsoredPosts: true,
+    enableBlockSponsoredSidebar: true,
+    enableBlockSponsoredReels: true,
     enableBlockReels: true,
+    enableBlockStories: true,
     enableBlockPeopleYouMayKnow: true,
     enableBlockFollowPosts: true,
     enableBlockJoinPosts: true,
+    enableCompactHiddenCards: true,
     enableGoDirectlyToFeeds: false,
     groupFeedDefaultSort: "new posts"
   };
@@ -43,11 +49,17 @@
   const antiRefreshInput = document.getElementById("enableAntiRefresh");
   const feedFilterInput = document.getElementById("enableFeedFilter");
   const postExpansionInput = document.getElementById("enablePostExpansion");
+  const commentSortAllInput = document.getElementById("enableCommentSortAll");
   const commentExpansionInput = document.getElementById("enableCommentExpansion");
+  const blockSponsoredPostsInput = document.getElementById("enableBlockSponsoredPosts");
+  const blockSponsoredSidebarInput = document.getElementById("enableBlockSponsoredSidebar");
+  const blockSponsoredReelsInput = document.getElementById("enableBlockSponsoredReels");
   const blockReelsInput = document.getElementById("enableBlockReels");
+  const blockStoriesInput = document.getElementById("enableBlockStories");
   const blockPeopleYouMayKnowInput = document.getElementById("enableBlockPeopleYouMayKnow");
   const blockFollowPostsInput = document.getElementById("enableBlockFollowPosts");
   const blockJoinPostsInput = document.getElementById("enableBlockJoinPosts");
+  const compactHiddenCardsInput = document.getElementById("enableCompactHiddenCards");
   const goDirectlyToFeedsInput = document.getElementById("enableGoDirectlyToFeeds");
   const groupFeedDefaultSortInput = document.getElementById("groupFeedDefaultSort");
   const roiHero = document.getElementById("roiHero");
@@ -77,6 +89,7 @@
       title: "Feed Cleanup",
       items: [
         { key: "removedReels", label: "Reels hidden" },
+        { key: "removedSponsoredReels", label: "Sponsored Reels removed" },
         { key: "removedFollowPosts", label: "Follow suggestions hidden" },
         { key: "removedJoinPosts", label: "Join suggestions hidden" },
         { key: "removedStories", label: "Stories hidden" },
@@ -100,7 +113,6 @@
     }
   ];
   let latestStats = null;
-  let clearStatusTimer = null;
   let isDirty = false;
   const DONATE_URL = "https://www.buymeacoffee.com/bzh22";
 
@@ -302,20 +314,6 @@
   function showStatus(message, state = "info", sticky = false) {
     status.textContent = message;
     status.dataset.state = state;
-
-    if (clearStatusTimer !== null) {
-      window.clearTimeout(clearStatusTimer);
-      clearStatusTimer = null;
-    }
-
-    if (!sticky) {
-      clearStatusTimer = window.setTimeout(() => {
-        if (status.textContent === message) {
-          status.textContent = "";
-          status.dataset.state = "idle";
-        }
-      }, 1500);
-    }
   }
 
   async function getActiveFacebookTabInfo() {
@@ -334,6 +332,9 @@
       url,
       title: typeof activeTab.title === "string" ? activeTab.title : "",
       id: typeof activeTab.id === "number" ? activeTab.id : null,
+      autoDiscardable: activeTab.autoDiscardable !== false,
+      discarded: activeTab.discarded === true,
+      status: typeof activeTab.status === "string" ? activeTab.status : "",
       isFacebook: /https?:\/\/(www|web)\.facebook\.com\//i.test(url)
     };
   }
@@ -343,62 +344,112 @@
       return {
         summary: null,
         logs: [],
-        summaryAttr: null,
         error: activeTab?.id == null ? "No active tab." : "Active tab is not a supported Facebook page."
       };
     }
 
     try {
-      const [executionResult] = await chrome.scripting.executeScript({
-        target: { tabId: activeTab.id },
-        func: () => {
-          const summaryAttr = document.documentElement?.getAttribute("data-faceberg-debug-summary") || null;
-          const summary = window.__FACEBERG_DEBUG_SUMMARY || (() => {
-            if (!summaryAttr) {
-              return null;
-            }
+      const [[executionResult], [guardExecutionResult]] = await Promise.all([
+        chrome.scripting.executeScript({
+          target: { tabId: activeTab.id },
+          func: () => {
+            const summary = window.__FACEBERG_DEBUG_SUMMARY || null;
+            const logs = Array.isArray(window.__FACEBERG_DEBUG_LOGS)
+              ? window.__FACEBERG_DEBUG_LOGS.slice(-80)
+              : [];
 
-            try {
-              return JSON.parse(summaryAttr);
-            } catch {
-              return null;
-            }
-          })();
-          const logs = Array.isArray(window.__FACEBERG_DEBUG_LOGS)
-            ? window.__FACEBERG_DEBUG_LOGS.slice(-80)
-            : [];
-
-          return {
-            summary,
-            logs,
-            summaryAttr,
-            hasDebugSummaryGlobal: !!window.__FACEBERG_DEBUG_SUMMARY,
-            hasDebugLogsGlobal: Array.isArray(window.__FACEBERG_DEBUG_LOGS)
-          };
-        }
-      });
+            return {
+              summary,
+              logs,
+              performance: window.__FACEBERG_PERF_SUMMARY || null,
+              hasDebugSummaryGlobal: !!window.__FACEBERG_DEBUG_SUMMARY,
+              hasDebugLogsGlobal: Array.isArray(window.__FACEBERG_DEBUG_LOGS)
+            };
+          }
+        }),
+        chrome.scripting.executeScript({
+          target: { tabId: activeTab.id },
+          world: "MAIN",
+          func: () => {
+            const state = window.__facebergAntiRefreshState;
+            const staleFeedGuard = window.__facebergStaleFeedGuardState;
+            const navigationEntry = window.performance?.getEntriesByType?.("navigation")?.[0];
+            return {
+              installed: !!state,
+              version: Number(state?.version || 0),
+              enabled: state?.enabled === true,
+              active: state?.active === true,
+              resumeGuardUntil: Number(state?.resumeGuardUntil || 0),
+              lastTrustedInteractionAt: Number(state?.lastTrustedInteractionAt || 0),
+              blockedNavigationCount: Number(state?.blockedNavigationCount || 0),
+              lastConfigAt: Number(state?.lastConfigAt || 0),
+              lastNavigationEvent: state?.lastNavigationEvent || null,
+              networkEvents: Array.isArray(state?.networkEvents)
+                ? state.networkEvents.slice(-80)
+                : [],
+              staleFeedGuard: staleFeedGuard
+                ? {
+                    version: Number(staleFeedGuard.version || 0),
+                    installedAt: Number(staleFeedGuard.installedAt || 0),
+                    activeFeatures:
+                      staleFeedGuard.activeFeatures &&
+                      typeof staleFeedGuard.activeFeatures === "object"
+                        ? { ...staleFeedGuard.activeFeatures }
+                        : {},
+                    loaderWrapped: staleFeedGuard.loaderWrapped === true,
+                    loaderMode: String(staleFeedGuard.loaderMode || ""),
+                    targetModules: Array.isArray(staleFeedGuard.targetModules)
+                      ? staleFeedGuard.targetModules
+                      : [],
+                    interceptedModules: Array.isArray(staleFeedGuard.interceptedModules)
+                      ? staleFeedGuard.interceptedModules
+                      : [],
+                    disabledModules: Array.isArray(staleFeedGuard.disabledModules)
+                      ? staleFeedGuard.disabledModules
+                      : [],
+                    lateDetectedModules:
+                      Array.isArray(staleFeedGuard.lateDetectedModules)
+                        ? staleFeedGuard.lateDetectedModules
+                        : [],
+                    latePatchedModules: Array.isArray(staleFeedGuard.latePatchedModules)
+                      ? staleFeedGuard.latePatchedModules
+                      : [],
+                    latePatchRequiresReload:
+                      staleFeedGuard.latePatchRequiresReload === true,
+                    errors: Array.isArray(staleFeedGuard.errors)
+                      ? staleFeedGuard.errors.slice(-20)
+                      : []
+                  }
+                : null,
+              documentWasDiscarded: document.wasDiscarded === true,
+              navigationType: navigationEntry?.type || "",
+              timeOrigin: Number(window.performance?.timeOrigin || 0),
+              visibilityState: document.visibilityState
+            };
+          }
+        })
+      ]);
 
       return {
         ...(executionResult?.result || {
           summary: null,
           logs: [],
-          summaryAttr: null,
           hasDebugSummaryGlobal: false,
           hasDebugLogsGlobal: false
         }),
+        antiRefresh: guardExecutionResult?.result || null,
         error: null
       };
     } catch (error) {
       return {
         summary: null,
         logs: [],
-        summaryAttr: null,
         error: String(error?.message || error || "Unknown page debug capture failure.")
       };
     }
   }
 
-  function buildDebugPayload({ settings, stats, activeTab, pageDebug }) {
+  function buildDebugPayload({ settings, stats, activeTab, pageDebug, antiRefreshDiagnostics }) {
     const manifest = chrome.runtime?.getManifest?.() || {};
     const payload = {
       extension: {
@@ -410,10 +461,10 @@
       settings,
       stats,
       pageDebug,
+      antiRefreshDiagnostics,
       pageDebugInstructions: {
-        summary: "window.__FACEBERG_DEBUG_SUMMARY || JSON.parse(document.documentElement.getAttribute('data-faceberg-debug-summary') || 'null')",
-        logs: "window.__FACEBERG_DEBUG_LOGS ? window.__FACEBERG_DEBUG_LOGS.slice(-80) : 'no __FACEBERG_DEBUG_LOGS'",
-        summaryAttr: "document.documentElement.getAttribute('data-faceberg-debug-summary')"
+        summary: "window.__FACEBERG_DEBUG_SUMMARY || null",
+        logs: "window.__FACEBERG_DEBUG_LOGS ? window.__FACEBERG_DEBUG_LOGS.slice(-80) : 'no __FACEBERG_DEBUG_LOGS'"
       }
     };
 
@@ -421,14 +472,21 @@
   }
 
   async function copyDebugInformation() {
-    const [settings, stats, activeTab] = await Promise.all([
+    const [settings, stats, activeTab, diagnostics] = await Promise.all([
       readSettings(),
       chrome.storage.local.get(STATS_STORAGE_DEFAULTS),
-      getActiveFacebookTabInfo()
+      getActiveFacebookTabInfo(),
+      chrome.storage.local.get({ antiRefreshDiagnostics: {} })
     ]);
 
     const pageDebug = await getActiveTabPageDebug(activeTab);
-    const payload = buildDebugPayload({ settings, stats, activeTab, pageDebug });
+    const payload = buildDebugPayload({
+      settings,
+      stats,
+      activeTab,
+      pageDebug,
+      antiRefreshDiagnostics: diagnostics.antiRefreshDiagnostics || {}
+    });
     await navigator.clipboard.writeText(payload);
   }
 
@@ -443,11 +501,17 @@
       enableAntiRefresh: antiRefreshInput.checked,
       enableFeedFilter: feedFilterInput.checked,
       enablePostExpansion: postExpansionInput.checked,
+      enableCommentSortAll: commentSortAllInput.checked,
       enableCommentExpansion: commentExpansionInput.checked,
+      enableBlockSponsoredPosts: blockSponsoredPostsInput.checked,
+      enableBlockSponsoredSidebar: blockSponsoredSidebarInput.checked,
+      enableBlockSponsoredReels: blockSponsoredReelsInput.checked,
       enableBlockReels: blockReelsInput.checked,
+      enableBlockStories: blockStoriesInput.checked,
       enableBlockPeopleYouMayKnow: blockPeopleYouMayKnowInput.checked,
       enableBlockFollowPosts: blockFollowPostsInput.checked,
       enableBlockJoinPosts: blockJoinPostsInput.checked,
+      enableCompactHiddenCards: compactHiddenCardsInput.checked,
       enableGoDirectlyToFeeds: goDirectlyToFeedsInput.checked,
       groupFeedDefaultSort: String(groupFeedDefaultSortInput?.value || DEFAULT_SETTINGS.groupFeedDefaultSort)
     };
@@ -502,14 +566,20 @@
   async function loadSettings() {
     const stored = await readSettings();
 
-    antiRefreshInput.checked = stored.enableAntiRefresh !== false;
+    antiRefreshInput.checked = stored.enableAntiRefresh === true;
     feedFilterInput.checked = stored.enableFeedFilter !== false;
     postExpansionInput.checked = stored.enablePostExpansion !== false;
+    commentSortAllInput.checked = stored.enableCommentSortAll !== false;
     commentExpansionInput.checked = stored.enableCommentExpansion !== false;
+    blockSponsoredPostsInput.checked = stored.enableBlockSponsoredPosts !== false;
+    blockSponsoredSidebarInput.checked = stored.enableBlockSponsoredSidebar !== false;
+    blockSponsoredReelsInput.checked = stored.enableBlockSponsoredReels !== false;
     blockReelsInput.checked = stored.enableBlockReels !== false;
+    blockStoriesInput.checked = stored.enableBlockStories !== false;
     blockPeopleYouMayKnowInput.checked = stored.enableBlockPeopleYouMayKnow !== false;
     blockFollowPostsInput.checked = stored.enableBlockFollowPosts !== false;
     blockJoinPostsInput.checked = stored.enableBlockJoinPosts !== false;
+    compactHiddenCardsInput.checked = stored.enableCompactHiddenCards !== false;
     goDirectlyToFeedsInput.checked = stored.enableGoDirectlyToFeeds === true;
     if (groupFeedDefaultSortInput) {
       groupFeedDefaultSortInput.value = String(stored.groupFeedDefaultSort || DEFAULT_SETTINGS.groupFeedDefaultSort);
@@ -584,11 +654,17 @@
     antiRefreshInput,
     feedFilterInput,
     postExpansionInput,
+    commentSortAllInput,
     commentExpansionInput,
+    blockSponsoredPostsInput,
+    blockSponsoredSidebarInput,
+    blockSponsoredReelsInput,
     blockReelsInput,
+    blockStoriesInput,
     blockPeopleYouMayKnowInput,
     blockFollowPostsInput,
     blockJoinPostsInput,
+    compactHiddenCardsInput,
     goDirectlyToFeedsInput,
     groupFeedDefaultSortInput
   ].forEach((input) => {

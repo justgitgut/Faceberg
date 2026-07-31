@@ -10,15 +10,18 @@ Post expansion is intentionally narrow:
 2. Prioritize buttons inside `story_message`, `story_body`, and story-preview containers.
 3. Press only visible `See more`-style controls that still look like inline post truncation.
 4. Avoid menus, media controls, and unrelated feed buttons.
+5. Keep Home expansion independent from the disabled React-owned feed cleanup.
+6. On Home, require an exact button inside a story body, reject links/navigation,
+   and ignore off-screen virtualized controls.
 
 ## First-Post Startup Behavior
 
 - The first visible feed post is special because Facebook often hydrates it in stages.
 - A valid `See more` button may already be in the DOM before Facebook attaches the live click handler.
-- Startup therefore needs:
-  - one eager document pass before async settings/storage resolution, and
-  - a few short follow-up passes while the page is still stabilizing.
-- A synthetic click that does nothing during that window must not permanently suppress the same button.
+- Startup therefore waits for saved settings and DOM readiness, then lets the
+  scoped feed observer react to later story-body hydration.
+- A native click that does nothing before Facebook wires the control must not
+  permanently suppress a replacement or subsequently mutated button.
 
 ## Candidate Rules
 
@@ -53,3 +56,5 @@ After touching post expansion, verify all of the following:
 4. Confirm later feed posts still expand normally.
 5. Confirm no unrelated menu, dialog, or media surface opens.
 6. Confirm already-expanded posts are not repeatedly spam-clicked.
+7. Scroll until a newly hydrated truncated post appears and confirm the bounded
+   post-scroll pass expands it without changing the page position.

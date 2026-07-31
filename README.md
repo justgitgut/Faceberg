@@ -6,10 +6,26 @@
 
 Chrome extension that declutters your Facebook feed, auto-expands posts and visible comment threads, keeps the main feed and supported group feeds sorted predictably, and offers optional anti-refresh protection.
 
-- Hides Reels, Stories, sponsored posts, People You May Know, and Follow/Join feed cards.
+- Current development build uses a lightweight compatibility runtime: it leaves
+  Facebook-owned Home-feed DOM and normal lifecycle events intact, wakes bounded
+  comment automation only after a trusted comment/post click or on a supported
+  direct post/media route, and disables only Facebook's named automatic
+  stale-Home, pushed-post-close, maintained-route feed cleanup, and independent
+  right-column Sponsored renderer/refetch modules.
+- Prevents the independent Sponsored sidebar component from rendering or
+  running its visibility-return refetch hook, and activates Facebook's own
+  `Hide post`/`Hide ad` control for detected main-feed ads. The experimental
+  compact-feedback option keeps Facebook's outer virtualized unit connected
+  while reducing the confirmed inner `Ad hidden`/`Post hidden` payload to a
+  one-pixel inert box. A verified ad already inside the first viewport is
+  handled before the first trusted user input; later visible cards retain the
+  stricter click-routing safety gate.
 - Auto-expands truncated posts and visible comment/reply threads.
-- Switches the active post dialog, direct post page, or supported media comment surface to `All comments` before expanding visible comment threads.
-- Blocks Facebook's forced tab reload when you return to the page.
+- Switches the active post dialog, direct post page, or supported media comment
+  surface to `All comments` before expanding visible comment threads.
+- Optionally disables Facebook's internal stale-feed reset hooks, blocks
+  automatic same-page or route-reset navigation attempts during tab resume,
+  and restores a recent scroll position after an unexpected reload.
 - Optionally lands you directly on the All Feed view with chronological sorting when opening Facebook.
 - Adds a popup action to copy extension debug information for troubleshooting.
 
@@ -41,12 +57,17 @@ Chrome extension that declutters your Facebook feed, auto-expands posts and visi
 4. Toggle features:
 	- Enable anti-refresh protection
 	- Enable feed cleanup
-	- Hide Reels containers
+	- Hide Sponsored feed posts
+	- Hide the right-column Sponsored module
+	- Remove Sponsored Reels from the full-screen Reels feed
+	- Hide Reels modules
+	- Hide the Stories tray
 	- Hide People You May Know
 	- Hide Follow posts
 	- Hide Join posts
 	- Auto-expand long posts
-	- Auto-expand comments
+	- Switch supported discussions to All comments
+	- Auto-expand replies and truncated comment text
 	- Choose the default root group feed sort
 5. Click **Apply** to save and refresh Facebook tabs.
 6. If **Go directly to feeds on activation** is enabled, Apply will open Facebook tabs on:
@@ -69,18 +90,51 @@ The extension auto-refreshes open Facebook tabs on install/update so filters app
 
 ## How It Works
 
-- `injected.js`: runs in page context and blocks common refresh triggers (`location.reload`, string-based timer refresh calls, meta refresh tags, and resume lifecycle events that try to refresh when a background tab becomes active again).
-- `content.js`: observes the feed and post dialogs, keeps the main feed and supported root group feeds in the intended order, hides unwanted feed content, expands posts, and coordinates comment automation across dialogs, direct posts, and supported media surfaces.
+- `stale-feed-guard.js`: while Anti-refresh is enabled, overloads exactly
+  `useCometHomeStaleFeedRefresh`, `useCometFeedPushViewCloseRefresh`, and
+  `useInvalidateCometNewsFeedConnectionOnMaintainedRouteUnmount`, plus the
+  Home-only router refresh handler `useCometNewsFeedRefreshThrottler` and
+  `useRefreshCometStoriesTrayOnMaintainedRouteUnmount`, at Facebook
+  module-definition time. Manual browser refresh, the feed refresh pill,
+  pagination, media, and routing modules remain native.
+- `injected.js`: installs a document-start, setting-controlled return guard. It
+  observes hidden/visible transitions without suppressing visibility or focus,
+  rejects only cancellable automatic reloads and non-user Home-route resets
+  during the return window, and leaves `fetch` and XMLHttpRequest untouched.
+- `content.js`: uses scoped DOM/navigation observers to react to feed, sidebar,
+  Reel-viewer, dialog, sorter, and reply changes. Sponsored feed mutations are
+  processed card-locally in the observer turn so a busy Chromium main thread
+  cannot starve cleanup. Exact standalone Reels and Stories module roots are
+  hidden with a reversible marker while their React-owned nodes remain
+  connected; other work is coalesced into the next rendering frame.
 - `popup.html` + `popup.js`: UI and storage-backed settings for feature toggles, grouped activity stats, period switching, saved-time estimates, and debug-information export.
 - `manifest.json`: MV3 config and script registration.
 
 ## Automation Boundary
 
-- Feed cleanup removes unwanted content from the DOM.
+- Main-feed cleanup leaves React-owned outer feed units intact so Facebook
+  retains native scrolling, loading, click routing, and media controls.
+  Experimental feedback compaction collapses the direct inner root before the
+  native hide click. A Sponsored card that hydrates late in a slow browser uses
+  the same inner-root-only boundary without invoking native Hide, and is
+  restored before paint if React recycles the unit for ordinary content.
+- Reels and Stories are treated as standalone modules rather than ordinary post
+  cards. Faceberg hides only roots that pass exact structural checks, keeps
+  those roots connected to React, and removes the marker immediately when the
+  setting is disabled or Facebook recycles the node.
+- Sponsored Reels use a separate full-screen viewer boundary. Faceberg requires
+  one exact `Sponsored` label inside the Reel video player, one video in the
+  item, multiple sibling Reel videos, and an outbound ad destination. An active
+  or preloaded match is removed from the Reel scroll-snap layout while its React
+  node stays connected. Reinserted matching items are removed again.
 - Post expansion clicks visible `See more`-style controls.
 - Comment automation remains scoped to the current post context.
-- In already-open post dialogs, direct post pages, and supported media comment surfaces, the extension resolves the active sorter, selects `All comments`, and then expands visible comment/reply controls.
-- Feed cleanup and post expansion still do not open random posts or unrelated menus.
+- In already-open post dialogs, direct post pages, and supported media comment
+  surfaces, the extension resolves the active sorter, selects `All comments`,
+  and then expands visible comment/reply controls. Popup replacement and
+  selection verification are mutation-driven and remain bounded even when a
+  browser delays rendering frames.
+- Sidebar cleanup and post expansion do not open random posts or unrelated menus.
 
 See [docs/architecture-v2.md](docs/architecture-v2.md) for the current architecture boundary.
 See [docs/regression-checklist.md](docs/regression-checklist.md) for the recommended validation checklist after automation changes.

@@ -1,23 +1,880 @@
-﻿(() => {
+(() => {
   "use strict";
 
-  if (window.__facebergNoRefreshInstalled) {
+  const COMMENT_INTENT_BRIDGE_VERSION = 7;
+  const COMMENT_INTENT_REQUEST_EVENT = "__facebergCommentIntentRequestV7";
+  const COMMENT_INTENT_RESULT_EVENT = "__facebergCommentIntentResultV7";
+
+  /*
+    Facebook's current comment-order toggle and menu rows are implemented by
+    Pressable/FDSMenuItem. Programmatic DOM clicks from an isolated
+    content-script world can either be ignored or produce a transient popup
+    without committing the React state. Keep this bridge in the page world and
+    accept only the exact visible sorter toggle or All comments row.
+  */
+  function installCommentIntentBridge() {
+    if (
+      Number(window.__facebergCommentIntentBridgeState?.version || 0) >=
+      COMMENT_INTENT_BRIDGE_VERSION
+    ) {
+      return;
+    }
+
+    const bridgeState = {
+      version: COMMENT_INTENT_BRIDGE_VERSION,
+      lastResult: null
+    };
+
+    function normalizeBridgeText(value) {
+      return String(value || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    }
+
+    function getPrimaryRowText(row) {
+      const visibleText = String(row?.innerText || "")
+        .split(/\r?\n/)
+        .map((part) => normalizeBridgeText(part))
+        .find(Boolean);
+      return visibleText || normalizeBridgeText(row?.getAttribute?.("aria-label"));
+    }
+
+    function isVisibleBridgeElement(element) {
+      if (!(element instanceof Element) || !element.isConnected) {
+        return false;
+      }
+
+      const rect = element.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) {
+        return false;
+      }
+
+      const style = window.getComputedStyle(element);
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number(style.opacity || 1) > 0
+      );
+    }
+
+    function getHandlerFromProps(props, candidate, source) {
+      if (!props || (typeof props !== "object" && typeof props !== "function")) {
+        return null;
+      }
+
+      if (typeof props.onClick === "function") {
+        return {
+          candidate,
+          handler: props.onClick,
+          handlerName: "onClick",
+          source
+        };
+      }
+
+      if (typeof props.onPress === "function") {
+        return {
+          candidate,
+          handler: props.onPress,
+          handlerName: "onPress",
+          source
+        };
+      }
+
+      return null;
+    }
+
+    function getEventHandlePressHandler(listeners, candidate, source) {
+      if (
+        !listeners ||
+        typeof listeners[Symbol.iterator] !== "function"
+      ) {
+        return null;
+      }
+
+      const matchingListeners = [];
+      for (const listener of listeners) {
+        if (!listener || typeof listener !== "object") {
+          continue;
+        }
+
+        const type = normalizeBridgeText(listener.type);
+        if (
+          typeof listener.callback === "function" &&
+          (type === "click" || type === "press")
+        ) {
+          matchingListeners.push({
+            callback: listener.callback,
+            capture: listener.capture === true,
+            type
+          });
+        }
+      }
+
+      /*
+        ReactDOM.createEventHandle stores one record per event type. Prefer the
+        bubbling click listener used by Pressable; a capture listener is still
+        valid when it is the only exact activation callback on this element.
+      */
+      matchingListeners.sort(
+        (left, right) => Number(left.capture) - Number(right.capture)
+      );
+      const listener = matchingListeners[0];
+      if (listener) {
+        return {
+          candidate,
+          handler: listener.callback,
+          handlerName: `eventHandle:${listener.type}`,
+          source,
+          eventHandleType: listener.type
+        };
+      }
+
+      /*
+        Facebook's current Pressable registers pointer/mouse state through
+        createEventHandle but keeps the committed action in React's delegated
+        click path. The exact validated control can therefore use its one native
+        HTMLElement click without a synthetic pointer prelude.
+      */
+      const eventTypes = new Set(
+        [...listeners]
+          .map((entry) => normalizeBridgeText(entry?.type))
+          .filter(Boolean)
+      );
+      if (
+        eventTypes.has("pointerdown") ||
+        eventTypes.has("mousedown") ||
+        eventTypes.has("keydown")
+      ) {
+        return {
+          candidate,
+          dispatchNativeClick: true,
+          handlerName: "eventHandle:native-click",
+          source
+        };
+      }
+
+      return null;
+    }
+
+    function createEventHandleArgument(target, type) {
+      const rect = target.getBoundingClientRect();
+      const clientX = Math.max(0, rect.left + Math.min(rect.width / 2, 8));
+      const clientY = Math.max(0, rect.top + Math.min(rect.height / 2, 8));
+      const nativeEvent = new MouseEvent(type === "press" ? "click" : type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: window,
+        detail: 1,
+        button: 0,
+        buttons: 0,
+        clientX,
+        clientY
+      });
+      let propagationStopped = false;
+
+      /*
+        createEventHandle callbacks receive a React SyntheticEvent. Facebook's
+        Pressable callback uses only this public event surface, so provide that
+        shape without redispatching a second DOM event or crossing feed cards.
+      */
+      return {
+        _reactName: null,
+        bubbles: true,
+        button: 0,
+        buttons: 0,
+        cancelable: true,
+        clientX,
+        clientY,
+        currentTarget: target,
+        defaultPrevented: false,
+        detail: 1,
+        eventPhase: Event.AT_TARGET,
+        isDefaultPrevented() {
+          return this.defaultPrevented;
+        },
+        isPropagationStopped() {
+          return propagationStopped;
+        },
+        isTrusted: false,
+        nativeEvent,
+        persist() {},
+        preventDefault() {
+          this.defaultPrevented = true;
+          nativeEvent.preventDefault();
+        },
+        stopPropagation() {
+          propagationStopped = true;
+          nativeEvent.stopPropagation();
+        },
+        target,
+        timeStamp: nativeEvent.timeStamp,
+        type: nativeEvent.type
+      };
+    }
+
+    function getReactPressHandler(row) {
+      const candidates = [row, ...row.querySelectorAll("*")].slice(0, 40);
+      for (const candidate of candidates) {
+        for (const propertyName of Object.getOwnPropertyNames(candidate)) {
+          if (
+            propertyName.startsWith("__reactProps$") ||
+            propertyName.startsWith("__reactEventHandlers$")
+          ) {
+            const handler = getHandlerFromProps(
+              candidate[propertyName],
+              candidate,
+              propertyName.split("$")[0]
+            );
+            if (handler) {
+              return handler;
+            }
+          }
+
+          if (propertyName.startsWith("__reactListeners$")) {
+            const handler = getEventHandlePressHandler(
+              candidate[propertyName],
+              candidate,
+              "__reactListeners"
+            );
+            if (handler) {
+              return handler;
+            }
+          }
+
+          if (!propertyName.startsWith("__reactFiber$")) {
+            continue;
+          }
+
+          /*
+            Current Facebook builds can expose only the host Fiber on Pressable
+            nodes. Walk through wrapper components but stop before crossing into
+            a different host DOM element, so the resolved callback still belongs
+            to this exact sorter control or menu row.
+          */
+          let fiber = candidate[propertyName];
+          for (let depth = 0; fiber && depth < 14; depth += 1) {
+            if (
+              depth > 0 &&
+              fiber.stateNode instanceof Element &&
+              fiber.stateNode !== candidate
+            ) {
+              break;
+            }
+
+            for (const [propsName, props] of [
+              ["memoizedProps", fiber.memoizedProps],
+              ["pendingProps", fiber.pendingProps]
+            ]) {
+              const handler = getHandlerFromProps(
+                props,
+                candidate,
+                `fiber.${propsName}`
+              );
+              if (handler) {
+                return handler;
+              }
+            }
+
+            fiber = fiber.return;
+          }
+        }
+      }
+
+      return null;
+    }
+
+    function describeReactBindings(target) {
+      const candidates = [target, ...target.querySelectorAll("*")].slice(0, 40);
+      const propertyNames = [];
+      const listenerStores = [];
+      for (const candidate of candidates) {
+        for (const propertyName of Object.getOwnPropertyNames(candidate)) {
+          if (
+            propertyName.startsWith("__react") &&
+            !propertyNames.includes(propertyName.split("$")[0])
+          ) {
+            propertyNames.push(propertyName.split("$")[0]);
+          }
+
+          if (
+            propertyName.startsWith("__reactListeners$") &&
+            candidate[propertyName] &&
+            typeof candidate[propertyName][Symbol.iterator] === "function"
+          ) {
+            const eventTypes = [];
+            let listenerCount = 0;
+            for (const listener of candidate[propertyName]) {
+              listenerCount += 1;
+              const type = normalizeBridgeText(listener?.type);
+              if (type && !eventTypes.includes(type)) {
+                eventTypes.push(type);
+              }
+            }
+            listenerStores.push({
+              eventTypes: eventTypes.slice(0, 16),
+              listenerCount,
+              target: candidate === target ? "target" : candidate.tagName.toLowerCase()
+            });
+          }
+        }
+      }
+
+      return {
+        candidateCount: candidates.length,
+        listenerStores: listenerStores.slice(0, 12),
+        propertyNames: propertyNames.slice(0, 12)
+      };
+    }
+
+    function emitBridgeResult(row, result) {
+      bridgeState.lastResult = result;
+      try {
+        row.dispatchEvent(
+          new CustomEvent(COMMENT_INTENT_RESULT_EVENT, {
+            bubbles: true,
+            composed: true,
+            detail: JSON.stringify(result)
+          })
+        );
+      } catch (_error) {
+        /* A diagnostic response must never affect Facebook's UI. */
+      }
+    }
+
+    document.addEventListener(COMMENT_INTENT_REQUEST_EVENT, (event) => {
+      let request = null;
+      try {
+        request = JSON.parse(String(event.detail || ""));
+      } catch (_error) {
+        return;
+      }
+
+      const target = event.target;
+      const intent = String(request?.intent || "");
+      const menu = target instanceof Element
+        ? target.closest('[role="menu"][aria-label="Comment Ordering"]')
+        : null;
+      const result = {
+        requestId: String(request?.requestId || ""),
+        activated: false,
+        bridgeVersion: COMMENT_INTENT_BRIDGE_VERSION,
+        handlerName: "",
+        reason: ""
+      };
+
+      const isAllCommentsRow =
+        intent === "all-comments" &&
+        target instanceof Element &&
+        target.matches(
+          '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [role="option"], [role="radio"]'
+        ) &&
+        menu instanceof Element &&
+        isVisibleBridgeElement(menu) &&
+        getPrimaryRowText(target) === "all comments";
+      const isSorterToggle =
+        intent === "toggle-comment-ordering" &&
+        target instanceof Element &&
+        target.matches(
+          '[role="button"][aria-haspopup="menu"], [role="link"][aria-haspopup="menu"], [tabindex][aria-haspopup="menu"]'
+        ) &&
+        !target.closest('[role="menu"], [role="toolbar"]') &&
+        target.closest('[role="dialog"][aria-modal="true"]') instanceof Element &&
+        /^(?:most relevant|newest|all comments|oldest|top comments|recent)$/i.test(
+          getPrimaryRowText(target)
+        );
+
+      if (
+        !result.requestId ||
+        !(target instanceof Element) ||
+        !isVisibleBridgeElement(target) ||
+        (!isAllCommentsRow && !isSorterToggle)
+      ) {
+        result.reason = "invalid-target";
+        if (target instanceof Element) {
+          emitBridgeResult(target, result);
+        }
+        return;
+      }
+
+      const pressHandler = getReactPressHandler(target);
+      if (!pressHandler) {
+        result.reason = "react-handler-not-found";
+        result.diagnostic = describeReactBindings(target);
+        emitBridgeResult(target, result);
+        return;
+      }
+
+      try {
+        if (pressHandler.dispatchNativeClick) {
+          pressHandler.candidate.click();
+        } else if (pressHandler.eventHandleType) {
+          pressHandler.handler(
+            createEventHandleArgument(
+              pressHandler.candidate,
+              pressHandler.eventHandleType
+            )
+          );
+        } else {
+          /*
+            Direct FDS menu-row props are closures over their intended action
+            and are explicitly zero-argument. Do not pass an event to that
+            separate callback shape.
+          */
+          pressHandler.handler();
+        }
+        result.activated = true;
+        result.handlerName = pressHandler.handlerName;
+        result.handlerSource = pressHandler.source;
+        result.reason = pressHandler.dispatchNativeClick
+          ? "native-click-invoked"
+          : "react-handler-invoked";
+      } catch (error) {
+        result.reason = "react-handler-threw";
+        result.error = String(error?.message || error || "").slice(0, 200);
+      }
+
+      emitBridgeResult(target, result);
+    }, true);
+
+    window.__facebergCommentIntentBridgeState = bridgeState;
+  }
+
+  installCommentIntentBridge();
+
+  const COMPATIBILITY_GUARD_VERSION = 13;
+  const COMPATIBILITY_CONFIG_KIND = "anti-refresh-config-v13";
+  const SPA_NAVIGATION_EVENT = "__facebergSpaNavigationV1";
+  const existingGuardVersion = Number(
+    window.__facebergAntiRefreshState?.version || 0
+  );
+
+  if (
+    window.__facebergNoRefreshInstalled &&
+    existingGuardVersion >= COMPATIBILITY_GUARD_VERSION
+  ) {
     return;
+  }
+
+  /*
+    An extension reload can reinject this file into an existing Facebook
+    document. Disable an older listener through its legacy config channel, then
+    install the replacement through a versioned channel that the retired
+    listener cannot observe or re-enable.
+  */
+  if (window.__facebergNoRefreshInstalled && existingGuardVersion > 0) {
+    for (const kind of [
+      "anti-refresh-config",
+      "anti-refresh-config-v4",
+      "anti-refresh-config-v5",
+      "anti-refresh-config-v6",
+      "anti-refresh-config-v7",
+      "anti-refresh-config-v8",
+      "anti-refresh-config-v9",
+      "anti-refresh-config-v10",
+      "anti-refresh-config-v11",
+      "anti-refresh-config-v12"
+    ]) {
+      window.postMessage(
+        {
+          source: "faceberg",
+          kind,
+          enabled: false
+        },
+        "*"
+      );
+    }
   }
 
   window.__facebergNoRefreshInstalled = true;
 
-  const BLOCK_MSG = "[Faceberg] Blocked forced refresh call.";
-  const SUSPICIOUS_EVENT_TYPES = /^(visibilitychange|focus|blur|pageshow|pagehide|freeze|resume|popstate|hashchange)$/;
-  const VOLATILE_REFRESH_PARAM_PATTERN = /^(?:__.*|fbclid|ref|refsrc|notif_id|notif_t|notif_type|acontext|paipv|locale|ti|eav|av|mibextid|_rdc|_rdr|__tn__|__xts__|utm_[a-z0-9_]+)$/i;
-  const RESUME_SUPPRESSION_WINDOW_MS = 10000;
-  let wasPageHidden = false;
-  let reallyHidden = false;
-  let resumeSuppressionUntil = 0;
-  let lastUserInteractionAt = 0;
+  /*
+    Compatibility mode keeps the old broad anti-refresh implementation below
+    disabled. Install only a narrow navigation guard during the hidden/return
+    interval. Visibility and focus remain untouched because Facebook and the
+    browser use them to coordinate media playback. Only Navigation API reloads
+    and pushState/replaceState Home resets are guarded; no DOM, timer, fetch,
+    location, or browser method is changed.
+  */
+  const COMPATIBILITY_SAFE_MODE = true;
+  if (COMPATIBILITY_SAFE_MODE) {
+    const GUARD_VERSION = COMPATIBILITY_GUARD_VERSION;
+    const RESUME_GUARD_WINDOW_MS = 8000;
+    const USER_NAVIGATION_GRACE_MS = 1500;
+    let enabled = false;
+    let wasHidden = document.visibilityState === "hidden";
+    let resumeGuardUntil = 0;
+    let lastTrustedInteractionAt = 0;
+    let blockedNavigationCount = 0;
+    let lastConfigAt = 0;
+    let lastNavigationEvent = null;
 
-  function isSuspiciousNavigationSource(source) {
-    return /location\.reload\s*\(|\.reload\s*\(|history\.go\s*\(\s*0\s*\)|location\.(assign|replace)\s*\(|window\.location\s*=|document\.location\s*=|location\.href\s*=|document\.URL\s*=|visibilitystate|document\.hidden|popstate|hashchange/i.test(source);
+    function beginResumeGuard(now = Date.now()) {
+      resumeGuardUntil = Math.max(resumeGuardUntil, now + RESUME_GUARD_WINDOW_MS);
+    }
+
+    function noteTrustedInteraction(event) {
+      if (event?.isTrusted === true) {
+        lastTrustedInteractionAt = Date.now();
+      }
+    }
+
+    function isResumeGuardWindow(now = Date.now()) {
+      return (
+        wasHidden ||
+        document.visibilityState === "hidden" ||
+        now < resumeGuardUntil
+      );
+    }
+
+    function isAutomaticResumeNavigation() {
+      const now = Date.now();
+      return enabled &&
+        isResumeGuardWindow(now) &&
+        (lastTrustedInteractionAt === 0 || now - lastTrustedInteractionAt > USER_NAVIGATION_GRACE_MS);
+    }
+
+    function normalizePathname(pathname) {
+      const normalized = String(pathname || "/").replace(/\/+$/, "");
+      return normalized || "/";
+    }
+
+    function isRootFeedPath(pathname) {
+      const normalized = normalizePathname(pathname);
+      return normalized === "/" || normalized === "/home.php";
+    }
+
+    function isAutomaticHomeRouteReset(target) {
+      if (!isAutomaticResumeNavigation()) {
+        return false;
+      }
+
+      try {
+        const destination = new URL(String(target), window.location.href);
+        const current = new URL(window.location.href);
+        return (
+          destination.origin === current.origin &&
+          !isRootFeedPath(current.pathname) &&
+          isRootFeedPath(destination.pathname)
+        );
+      } catch (_error) {
+        return false;
+      }
+    }
+
+    function emitNavigationDiagnostic(details) {
+      try {
+        document.dispatchEvent(
+          new CustomEvent("__facebergAntiRefreshNavigation", {
+            detail: JSON.stringify(details)
+          })
+        );
+      } catch (_error) {
+        /* Diagnostics must never affect navigation handling. */
+      }
+    }
+
+    function emitSpaNavigation(methodName, destination) {
+      try {
+        document.dispatchEvent(
+          new CustomEvent(SPA_NAVIGATION_EVENT, {
+            detail: JSON.stringify({
+              method: methodName,
+              destination: destination == null ? "" : String(destination),
+              url: window.location.href
+            })
+          })
+        );
+      } catch (_error) {
+        /* SPA wake diagnostics must never affect Facebook navigation. */
+      }
+    }
+
+    function reportBlockedNavigation(kind, target = "", details = {}) {
+      blockedNavigationCount += 1;
+      window.postMessage(
+        {
+          source: "faceberg",
+          kind: "stat",
+          stat: "preventedRefreshes",
+          count: 1
+        },
+        "*"
+      );
+
+      const diagnostic = {
+        ...details,
+        at: Date.now(),
+        blocked: true,
+        destination: target,
+        eventKind: details.eventKind || kind,
+        navigationType: details.navigationType || (
+          kind === "reload" ? "reload" : "route-reset"
+        ),
+        visibilityState: document.visibilityState,
+        guardVersion: GUARD_VERSION
+      };
+      lastNavigationEvent = diagnostic;
+      emitNavigationDiagnostic(diagnostic);
+    }
+
+    function guardHistoryRouteResets() {
+      for (const methodName of ["pushState", "replaceState"]) {
+        try {
+          const original = window.history?.[methodName];
+          if (
+            typeof original !== "function" ||
+            original.__facebergGuardVersion >= GUARD_VERSION
+          ) {
+            continue;
+          }
+
+          const wrapped = function (...args) {
+            const destination = args[2];
+            if (
+              destination != null &&
+              isAutomaticHomeRouteReset(destination)
+            ) {
+              reportBlockedNavigation(
+                `history.${methodName}`,
+                String(destination)
+              );
+              return undefined;
+            }
+
+            const result = original.apply(this, args);
+            emitSpaNavigation(methodName, destination);
+            return result;
+          };
+          Object.defineProperty(wrapped, "__facebergGuardVersion", {
+            value: GUARD_VERSION
+          });
+          window.history[methodName] = wrapped;
+        } catch (_error) {
+          /* History methods are normally writable; Navigation API remains the fallback. */
+        }
+      }
+    }
+
+    const handledVisibilityEvents = new WeakSet();
+    function handleVisibilityChange(event) {
+      if (handledVisibilityEvents.has(event)) {
+        return;
+      }
+      handledVisibilityEvents.add(event);
+
+      if (document.visibilityState === "hidden") {
+        wasHidden = true;
+        emitNavigationDiagnostic({
+          at: Date.now(),
+          blocked: false,
+          eventKind: "visibility-hidden",
+          navigationType: "",
+          userInitiated: false,
+          visibilityState: document.visibilityState,
+          enabled,
+          resumeGuardUntil,
+          guardVersion: GUARD_VERSION
+        });
+        return;
+      }
+
+      if (wasHidden) {
+        wasHidden = false;
+        beginResumeGuard();
+        const details = {
+          at: Date.now(),
+          blocked: false,
+          eventKind: "visibility-visible",
+          navigationType: "",
+          userInitiated: false,
+          visibilityState: document.visibilityState,
+          enabled,
+          resumeGuardUntil,
+          suppression: "none",
+          guardVersion: GUARD_VERSION
+        };
+        lastNavigationEvent = details;
+        emitNavigationDiagnostic(details);
+      }
+    }
+
+    /*
+      Record the return transition but never suppress it. Blocking visibility
+      and focus did not prevent Facebook's soft feed reset, while those events
+      are required for reliable Reel playback.
+    */
+    window.addEventListener("visibilitychange", handleVisibilityChange, true);
+    document.addEventListener("visibilitychange", handleVisibilityChange, true);
+
+    for (const eventType of ["pointerdown", "keydown", "touchstart"]) {
+      document.addEventListener(eventType, noteTrustedInteraction, {
+        capture: true,
+        passive: true
+      });
+    }
+
+    window.addEventListener("message", (event) => {
+      if (
+        event.source !== window ||
+        event.data?.source !== "faceberg" ||
+        event.data?.kind !== COMPATIBILITY_CONFIG_KIND
+      ) {
+        return;
+      }
+
+      enabled = event.data.enabled === true;
+      lastConfigAt = Date.now();
+      if (!enabled) {
+        resumeGuardUntil = 0;
+        wasHidden = document.visibilityState === "hidden";
+      }
+    }, true);
+
+    if (window.navigation?.addEventListener) {
+      window.navigation.addEventListener("navigate", (event) => {
+        if (!enabled || !isResumeGuardWindow()) {
+          return;
+        }
+
+        const details = {
+          at: Date.now(),
+          cancelable: event.cancelable === true,
+          destination: event.destination?.url || "",
+          eventKind: "navigate",
+          navigationType: event.navigationType || "",
+          userInitiated: event.userInitiated === true,
+          visibilityState: document.visibilityState,
+          enabled,
+          resumeGuardUntil,
+          automaticResumeNavigation: isAutomaticResumeNavigation(),
+          guardVersion: GUARD_VERSION
+        };
+        lastNavigationEvent = details;
+
+        const blocksReload = event.navigationType === "reload";
+        const blocksRouteReset = isAutomaticHomeRouteReset(
+          event.destination?.url || ""
+        );
+        if (
+          (!blocksReload && !blocksRouteReset) ||
+          event.userInitiated === true ||
+          event.cancelable !== true ||
+          !isAutomaticResumeNavigation()
+        ) {
+          emitNavigationDiagnostic({
+            ...details,
+            blocked: false,
+            rejectionReason:
+              !blocksReload && !blocksRouteReset
+                ? "not-reload-or-route-reset"
+                : event.userInitiated === true
+                  ? "user-initiated"
+                  : event.cancelable !== true
+                    ? "not-cancelable"
+                    : "trusted-input-grace"
+          });
+          return;
+        }
+
+        event.preventDefault();
+        reportBlockedNavigation(
+          blocksReload ? "reload" : "route-reset",
+          event.destination?.url || "",
+          details
+        );
+      }, true);
+    }
+
+    guardHistoryRouteResets();
+
+    window.__facebergAntiRefreshState = Object.freeze({
+      version: GUARD_VERSION,
+      get enabled() {
+        return enabled;
+      },
+      get active() {
+        return isAutomaticResumeNavigation();
+      },
+      get resumeGuardUntil() {
+        return resumeGuardUntil;
+      },
+      get lastTrustedInteractionAt() {
+        return lastTrustedInteractionAt;
+      },
+      get blockedNavigationCount() {
+        return blockedNavigationCount;
+      },
+      get lastConfigAt() {
+        return lastConfigAt;
+      },
+      get lastNavigationEvent() {
+        return lastNavigationEvent ? { ...lastNavigationEvent } : null;
+      },
+      networkDiagnosticsInstalled: false,
+      networkEvents: Object.freeze([]),
+      safeMode: true,
+      reason: "navigation-only-reload-and-home-route-reset"
+    });
+    return;
+  }
+
+  const GUARD_VERSION = 3;
+  const RESUME_GUARD_WINDOW_MS = 10000;
+  const USER_NAVIGATION_GRACE_MS = 1800;
+  const VOLATILE_REFRESH_PARAM_PATTERN =
+    /^(?:__.*|fbclid|ref|refsrc|notif_id|notif_t|notif_type|acontext|paipv|locale|ti|eav|av|mibextid|_rdc|_rdr|__tn__|__xts__|utm_[a-z0-9_]+)$/i;
+  let enabled = false;
+  let wasHidden = document.visibilityState === "hidden";
+  let resumeGuardUntil = 0;
+  let lastTrustedInteractionAt = 0;
+  let blockedNavigationCount = 0;
+  let lastConfigAt = 0;
+  let lastNavigationEvent = null;
+
+  function emitNavigationDiagnostic(details) {
+    try {
+      document.dispatchEvent(
+        new CustomEvent("__facebergAntiRefreshNavigation", {
+          detail: JSON.stringify(details)
+        })
+      );
+    } catch (_error) {
+      /* Diagnostics must never affect navigation handling. */
+    }
+  }
+
+  function reportBlockedNavigation(kind, target = "") {
+    blockedNavigationCount += 1;
+    console.debug("[Faceberg] Blocked automatic resume navigation.", kind, target);
+    window.postMessage(
+      {
+        source: "faceberg",
+        kind: "stat",
+        stat: "preventedRefreshes",
+        count: 1
+      },
+      "*"
+    );
+  }
+
+  function beginResumeGuard(now = Date.now()) {
+    resumeGuardUntil = Math.max(resumeGuardUntil, now + RESUME_GUARD_WINDOW_MS);
+  }
+
+  function noteTrustedInteraction(event) {
+    if (event?.isTrusted === true) {
+      lastTrustedInteractionAt = Date.now();
+    }
+  }
+
+  function isAutomaticResumeNavigation() {
+    const now = Date.now();
+    return enabled &&
+      now < resumeGuardUntil &&
+      (lastTrustedInteractionAt === 0 || now - lastTrustedInteractionAt > USER_NAVIGATION_GRACE_MS);
   }
 
   function safeUrl(input) {
@@ -29,45 +886,25 @@
   }
 
   function normalizePathname(pathname) {
-    const raw = String(pathname || "/");
-    const trimmed = raw.replace(/\/+$/, "");
+    const trimmed = String(pathname || "/").replace(/\/+$/, "");
     return trimmed || "/";
   }
 
-  function toNavigationTarget(input) {
-    if (input && typeof input === "object") {
-      if (typeof input.href === "string") {
-        return input.href;
-      }
-
-      try {
-        return String(input);
-      } catch (_error) {
-        return "";
-      }
-    }
-
-    return String(input ?? "");
+  function isRootFeedPath(pathname) {
+    const normalized = normalizePathname(pathname);
+    return normalized === "/" || normalized === "/home.php";
   }
 
   function getCanonicalSearch(url) {
-    const entries = [];
-
-    for (const [key, value] of url.searchParams.entries()) {
-      if (VOLATILE_REFRESH_PARAM_PATTERN.test(key)) {
-        continue;
-      }
-
-      entries.push([key, value]);
-    }
-
-    entries.sort((left, right) => {
-      const leftKey = `${left[0]}\u0000${left[1]}`;
-      const rightKey = `${right[0]}\u0000${right[1]}`;
-      return leftKey.localeCompare(rightKey);
-    });
-
-    return entries.map(([key, value]) => `${key}=${value}`).join("&");
+    return [...url.searchParams.entries()]
+      .filter(([key]) => !VOLATILE_REFRESH_PARAM_PATTERN.test(key))
+      .sort((left, right) => {
+        const leftValue = `${left[0]}\u0000${left[1]}`;
+        const rightValue = `${right[0]}\u0000${right[1]}`;
+        return leftValue.localeCompare(rightValue);
+      })
+      .map(([key, value]) => `${key}=${value}`)
+      .join("&");
   }
 
   function getNavigationRelation(input) {
@@ -78,685 +915,328 @@
 
     const current = new URL(window.location.href);
     const sameOrigin = target.origin === current.origin;
-    const samePath = sameOrigin && target.pathname === current.pathname;
-    const sameNormalizedPath = sameOrigin && normalizePathname(target.pathname) === normalizePathname(current.pathname);
-    const sameSearch = samePath && target.search === current.search;
-    const sameHash = samePath && target.hash === current.hash;
-    const sameCanonicalSearch = sameNormalizedPath && getCanonicalSearch(target) === getCanonicalSearch(current);
+    const samePath = sameOrigin &&
+      normalizePathname(target.pathname) === normalizePathname(current.pathname);
+    const sameCanonicalSearch = samePath &&
+      getCanonicalSearch(target) === getCanonicalSearch(current);
+    const sameHash = target.hash === current.hash;
 
     return {
       target,
       current,
       sameOrigin,
-      samePath,
-      sameNormalizedPath,
-      sameSearch,
-      sameHash,
-      sameCanonicalSearch,
-      isHashOnlyChange: sameNormalizedPath && sameSearch && !sameHash
+      isDuplicateRoute: sameCanonicalSearch && sameHash,
+      isRouteReset: sameOrigin &&
+        !isRootFeedPath(current.pathname) &&
+        isRootFeedPath(target.pathname)
     };
   }
 
   function shouldBlockNavigationTarget(input) {
+    if (!isAutomaticResumeNavigation()) {
+      return false;
+    }
+
     const relation = getNavigationRelation(input);
-    if (!relation || !relation.sameOrigin || !relation.sameNormalizedPath) {
-      return false;
-    }
-
-    if (relation.isHashOnlyChange) {
-      return false;
-    }
-
-    if (relation.sameSearch || relation.sameCanonicalSearch) {
-      return true;
-    }
-
-    return resumeSuppressionUntil > Date.now();
+    return !!relation && (relation.isDuplicateRoute || relation.isRouteReset);
   }
 
-  function isSuspiciousTimerHandler(handler) {
-    if (typeof handler === "string") {
-      return /reload|refresh|force_reload|hard_refresh|history\.go\s*\(\s*0\s*\)/i.test(handler);
-    }
-
-    if (typeof handler === "function") {
-      const source = Function.prototype.toString.call(handler);
-      return isSuspiciousNavigationSource(source);
-    }
-
-    return false;
+  function createAbortedNavigationResult() {
+    const aborted = Promise.reject(new DOMException("Blocked by Faceberg", "AbortError"));
+    aborted.catch(() => {});
+    return { committed: aborted, finished: aborted };
   }
 
-  function getListenerSource(listener) {
-    if (typeof listener === "function") {
-      return Function.prototype.toString.call(listener);
-    }
-
-    if (listener && typeof listener.handleEvent === "function") {
-      return Function.prototype.toString.call(listener.handleEvent);
-    }
-
-    return "";
-  }
-
-  function isSuspiciousLifecycleListener(type, listener) {
-    if (!SUSPICIOUS_EVENT_TYPES.test(String(type))) {
-      return false;
-    }
-
-    const source = getListenerSource(listener);
-    if (!source) {
-      return false;
-    }
-
-    return isSuspiciousNavigationSource(source);
-  }
-
-  function guardSuspiciousEventHandlerProperties() {
-    const targets = [window, document, document.documentElement, document.body].filter(Boolean);
-    const eventProperties = [
-      "onvisibilitychange",
-      "onfocus",
-      "onblur",
-      "onpageshow",
-      "onresume",
-      "onpopstate",
-      "onhashchange"
-    ];
-
-    for (const target of targets) {
-      for (const propertyName of eventProperties) {
-        const targetPrototype = Object.getPrototypeOf(target);
-        const descriptor =
-          Object.getOwnPropertyDescriptor(target, propertyName) ||
-          Object.getOwnPropertyDescriptor(targetPrototype, propertyName);
-
-        if (!descriptor || typeof descriptor.set !== "function" || typeof descriptor.get !== "function") {
-          continue;
-        }
-
-        try {
-          Object.defineProperty(target, propertyName, {
-            configurable: true,
-            enumerable: descriptor.enumerable ?? true,
-            get() {
-              return descriptor.get.call(this);
-            },
-            set(value) {
-              if (typeof value === "function" && isSuspiciousLifecycleListener(propertyName.slice(2), value)) {
-                console.debug(BLOCK_MSG, "event-handler", propertyName);
-                reportStat("preventedRefreshes", 1);
-                descriptor.set.call(this, null);
-                return;
-              }
-
-              descriptor.set.call(this, value);
-            }
-          });
-        } catch (_error) {
-          // Ignore when event handler properties are not configurable.
-        }
-      }
-    }
-  }
-
-  function guardLocationReload() {
-    const wrapReload = (holder, methodName) => {
-      try {
-        const original = holder?.[methodName];
-        if (typeof original !== "function") {
-          return;
-        }
-
-        holder[methodName] = function (...args) {
-          console.debug(BLOCK_MSG, methodName, args);
-          reportStat("preventedRefreshes", 1);
-          return undefined;
-        };
-
-        holder[methodName].__facebergOriginal = original;
-      } catch (_error) {
-        // Ignore if browser blocks overriding location methods.
-      }
-    };
-
-    wrapReload(window.location, "reload");
-
-    if (window.Location && window.Location.prototype) {
-      wrapReload(window.Location.prototype, "reload");
-    }
-  }
-
-  function guardLocationNavigationMethods() {
-    const wrapMethod = (holder, methodName) => {
-      try {
-        const original = holder[methodName];
-        if (typeof original !== "function") {
-          return;
-        }
-
-        holder[methodName] = function (...args) {
-          if (args.length > 0 && shouldBlockNavigationTarget(args[0])) {
-            console.debug(BLOCK_MSG, methodName, args[0]);
-            reportStat("preventedRefreshes", 1);
-            return undefined;
-          }
-
-          return original.apply(this, args);
-        };
-
-        holder[methodName].__facebergOriginal = original;
-      } catch (_error) {
-        // Ignore if browser blocks overriding location methods.
-      }
-    };
-
-    wrapMethod(window.location, "assign");
-    wrapMethod(window.location, "replace");
-
-    if (window.Location && window.Location.prototype) {
-      wrapMethod(window.Location.prototype, "assign");
-      wrapMethod(window.Location.prototype, "replace");
-    }
-  }
-
-  function guardHistoryReloads() {
+  function wrapMethod(holder, methodName, shouldBlock, onBlocked) {
     try {
-      const originalGo = window.history.go.bind(window.history);
-      window.history.go = function (...args) {
-        if (args.length === 0 || Number(args[0]) === 0) {
-          console.debug(BLOCK_MSG, "history.go", args);
-          reportStat("preventedRefreshes", 1);
-          return undefined;
-        }
-
-        return originalGo(...args);
-      };
-
-      window.history.go.__facebergOriginal = originalGo;
-    } catch (_error) {
-      // Ignore if browser blocks overriding history methods.
-    }
-  }
-
-  function guardSuspiciousLifecycleListeners() {
-    try {
-      const originalAddEventListener = EventTarget.prototype.addEventListener;
-
-      EventTarget.prototype.addEventListener = function (type, listener, options) {
-        const isPageLifecycleTarget =
-          this === window ||
-          this === document ||
-          this === document.documentElement ||
-          this === document.body;
-
-        if (isPageLifecycleTarget && isSuspiciousLifecycleListener(type, listener)) {
-          console.debug(BLOCK_MSG, "event-listener", type);
-          reportStat("preventedRefreshes", 1);
-          return undefined;
-        }
-
-        return originalAddEventListener.call(this, type, listener, options);
-      };
-
-      EventTarget.prototype.addEventListener.__facebergOriginal = originalAddEventListener;
-    } catch (_error) {
-      // Ignore if browser blocks overriding addEventListener.
-    }
-  }
-
-  function guardStringTimeoutReload() {
-    const originalSetTimeout = window.setTimeout;
-    const originalSetInterval = window.setInterval;
-
-    window.setTimeout = function (handler, timeout, ...args) {
-      if (isSuspiciousTimerHandler(handler)) {
-        console.debug(BLOCK_MSG, handler);
-        reportStat("preventedRefreshes", 1);
-        return 0;
+      const original = holder?.[methodName];
+      if (typeof original !== "function" || original.__facebergOriginal) {
+        return;
       }
 
-      return originalSetTimeout.call(this, handler, timeout, ...args);
+      const wrapped = function (...args) {
+        if (shouldBlock(...args)) {
+          return onBlocked(...args);
+        }
+        return original.apply(this, args);
+      };
+      wrapped.__facebergOriginal = original;
+      holder[methodName] = wrapped;
+    } catch (_error) {
+      /* Location and Navigation methods are not writable in every Chrome build. */
+    }
+  }
+
+  function guardExplicitReloads() {
+    const shouldBlockReload = () => isAutomaticResumeNavigation();
+    const blockReload = () => {
+      reportBlockedNavigation("reload");
+      return undefined;
     };
 
-    window.setInterval = function (handler, timeout, ...args) {
-      if (isSuspiciousTimerHandler(handler)) {
-        console.debug(BLOCK_MSG, handler);
-        reportStat("preventedRefreshes", 1);
-        return 0;
+    wrapMethod(window.location, "reload", shouldBlockReload, blockReload);
+    wrapMethod(window.Location?.prototype, "reload", shouldBlockReload, blockReload);
+
+    wrapMethod(
+      window.history,
+      "go",
+      (delta) => (delta === undefined || Number(delta) === 0) && isAutomaticResumeNavigation(),
+      () => {
+        reportBlockedNavigation("history.go(0)");
+        return undefined;
       }
-
-      return originalSetInterval.call(this, handler, timeout, ...args);
-    };
-  }
-
-  function removeMetaRefresh() {
-    let removedCount = 0;
-
-    document.querySelectorAll("meta[http-equiv]").forEach((meta) => {
-      const value = (meta.getAttribute("http-equiv") || "").toLowerCase();
-      if (value === "refresh") {
-        meta.remove();
-        removedCount += 1;
-      }
-    });
-
-    if (removedCount > 0) {
-      reportStat("preventedRefreshes", removedCount);
-    }
-  }
-
-  function reportStat(stat, count) {
-    window.postMessage(
-      {
-        source: "faceberg",
-        kind: "stat",
-        stat,
-        count
-      },
-      "*"
     );
   }
 
-  function beginResumeSuppression(now = Date.now(), durationMs = RESUME_SUPPRESSION_WINDOW_MS) {
-    resumeSuppressionUntil = Math.max(resumeSuppressionUntil, now + durationMs);
-  }
-
-  function shouldSuppressResumeLifecycleEvent(event) {
-    const eventType = String(event?.type || "").toLowerCase();
-    const now = Date.now();
-
-    if (eventType === "visibilitychange") {
-      /* We spoofed document.visibilityState, so use the raw event flow:
-         the browser fires visibilitychange in alternating hidden→visible
-         transitions. Track with a boolean toggle. */
-      if (!reallyHidden) {
-        /* Transition: visible → hidden */
-        reallyHidden = true;
-        wasPageHidden = true;
-        return true; /* suppress so listeners don't see the hidden transition */
-      }
-
-      /* Transition: hidden → visible */
-      reallyHidden = false;
-      if (wasPageHidden) {
-        wasPageHidden = false;
-        beginResumeSuppression(now);
-        return true;
-      }
-
-      return false;
-    }
-
-    if (eventType === "pageshow") {
-      if (event?.persisted === true || wasPageHidden || resumeSuppressionUntil > now) {
-        wasPageHidden = false;
-        beginResumeSuppression(now, 1000);
-        return true;
-      }
-
-      return false;
-    }
-
-    if (eventType === "pagehide" || eventType === "freeze") {
-      reallyHidden = true;
-      wasPageHidden = true;
-      beginResumeSuppression(now);
-      return false;
-    }
-
-    if (eventType === "focus" || eventType === "resume") {
-      if (resumeSuppressionUntil > now) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  function suppressResumeLifecycleEvent(event) {
-    if (!shouldSuppressResumeLifecycleEvent(event)) {
-      return;
-    }
-
-    try {
-      event.stopImmediatePropagation();
-      event.stopPropagation();
-      event.preventDefault();
-      console.debug(BLOCK_MSG, "resume-lifecycle", event.type);
-      reportStat("preventedRefreshes", 1);
-    } catch (_error) {
-      // Ignore if the browser does not allow cancelling a given lifecycle event.
-    }
-  }
-
-  function guardLocationPropertySetter(propertyName, createNextUrl) {
-    try {
-      const descriptor = Object.getOwnPropertyDescriptor(Location.prototype, propertyName);
-      if (!descriptor || typeof descriptor.set !== "function" || typeof descriptor.get !== "function") {
-        return;
-      }
-
-      Object.defineProperty(Location.prototype, propertyName, {
-        configurable: true,
-        enumerable: descriptor.enumerable ?? true,
-        get: descriptor.get,
-        set(value) {
-          const nextUrl = createNextUrl(value);
-          if (nextUrl && shouldBlockNavigationTarget(nextUrl.href)) {
-            console.debug(BLOCK_MSG, `location.${propertyName} setter`, nextUrl.href);
-            reportStat("preventedRefreshes", 1);
-            return;
-          }
-
-          descriptor.set.call(this, value);
-        }
-      });
-    } catch (_error) {
-      // Ignore if browser blocks overriding Location property setters.
-    }
-  }
-
-  function guardLocationHrefSetter() {
-    try {
-      const hrefDescriptor = Object.getOwnPropertyDescriptor(Location.prototype, "href");
-      if (!hrefDescriptor || typeof hrefDescriptor.set !== "function") {
-        return;
-      }
-
-      Object.defineProperty(Location.prototype, "href", {
-        configurable: true,
-        enumerable: true,
-        get: hrefDescriptor.get,
-        set(value) {
-          if (shouldBlockNavigationTarget(value)) {
-            console.debug(BLOCK_MSG, "location.href setter", value);
-            reportStat("preventedRefreshes", 1);
-            return;
-          }
-
-          hrefDescriptor.set.call(this, value);
-        }
-      });
-    } catch (_error) {
-      // Ignore if browser blocks overriding location.href.
-    }
-  }
-
-  function guardHostLocationSetter(hostPrototype, hostName) {
-    try {
-      const descriptor = Object.getOwnPropertyDescriptor(hostPrototype, "location");
-      if (!descriptor || typeof descriptor.set !== "function" || typeof descriptor.get !== "function") {
-        return;
-      }
-
-      Object.defineProperty(hostPrototype, "location", {
-        configurable: true,
-        enumerable: descriptor.enumerable ?? true,
-        get: descriptor.get,
-        set(value) {
-          const target = toNavigationTarget(value);
-          if (target && shouldBlockNavigationTarget(target)) {
-            console.debug(BLOCK_MSG, `${hostName}.location setter`, target);
-            reportStat("preventedRefreshes", 1);
-            return;
-          }
-
-          descriptor.set.call(this, value);
-        }
-      });
-    } catch (_error) {
-      // Ignore if browser blocks overriding host location setter.
-    }
-  }
-
-  function spoofVisibilityState() {
-    try {
-      Object.defineProperty(document, "visibilityState", {
-        configurable: true,
-        enumerable: true,
-        get() {
-          return "visible";
-        }
-      });
-
-      Object.defineProperty(document, "hidden", {
-        configurable: true,
-        enumerable: true,
-        get() {
-          return false;
-        }
-      });
-
-      Object.defineProperty(document, "webkitVisibilityState", {
-        configurable: true,
-        enumerable: true,
-        get() {
-          return "visible";
-        }
-      });
-
-      Object.defineProperty(document, "webkitHidden", {
-        configurable: true,
-        enumerable: true,
-        get() {
-          return false;
-        }
-      });
-    } catch (_error) {
-      // Ignore if browser blocks overriding visibility properties.
-    }
-
-    try {
-      const originalHasFocus = Document.prototype.hasFocus;
-      Document.prototype.hasFocus = function () {
-        return true;
+  function guardLocationMethods() {
+    for (const methodName of ["assign", "replace"]) {
+      const shouldBlock = (target) => shouldBlockNavigationTarget(target);
+      const onBlocked = (target) => {
+        reportBlockedNavigation(`location.${methodName}`, target);
+        return undefined;
       };
-      Document.prototype.hasFocus.__facebergOriginal = originalHasFocus;
-    } catch (_error) {
-      // Ignore if browser blocks overriding hasFocus.
+      wrapMethod(window.location, methodName, shouldBlock, onBlocked);
+      wrapMethod(window.Location?.prototype, methodName, shouldBlock, onBlocked);
     }
-  }
 
-  function guardWindowOpen() {
     try {
-      const originalOpen = window.open;
-      if (typeof originalOpen !== "function") {
-        return;
-      }
-
-      window.open = function (url, target, ...rest) {
-        const effectiveTarget = target === undefined ? "_blank" : String(target);
-        const isSelfTarget =
-          effectiveTarget === "_self" ||
-          effectiveTarget === "" ||
-          effectiveTarget === "_top" ||
-          effectiveTarget === "_parent";
-
-        if (isSelfTarget && url && shouldBlockNavigationTarget(url)) {
-          console.debug(BLOCK_MSG, "window.open", url, effectiveTarget);
-          reportStat("preventedRefreshes", 1);
-          return null;
-        }
-
-        return originalOpen.apply(this, [url, target, ...rest]);
-      };
-
-      window.open.__facebergOriginal = originalOpen;
-    } catch (_error) {
-      // Ignore if browser blocks overriding window.open.
-    }
-  }
-
-  function guardFetch() {
-    try {
-      const originalFetch = window.fetch;
-      if (typeof originalFetch !== "function") {
-        return;
-      }
-
-      window.fetch = function guardedFetch(resource, init) {
-        try {
-          if (resumeSuppressionUntil > Date.now()) {
-            const sinceInteraction = Date.now() - lastUserInteractionAt;
-            const isAutomatic = lastUserInteractionAt === 0 || sinceInteraction > 2000;
-
-            if (isAutomatic) {
-              const url = resource instanceof Request ? resource.url : String(resource ?? "");
-              const method = (
-                (init?.method) ||
-                (resource instanceof Request ? resource.method : undefined) ||
-                "GET"
-              ).toUpperCase();
-
-              if (method === "POST" && /\.facebook\.com\/api\/graphql\//i.test(url)) {
-                const delay = Math.max(200, resumeSuppressionUntil - Date.now() + 200);
-                console.debug(BLOCK_MSG, "delaying auto graphql feed-refresh", delay + "ms");
-                return new Promise((resolve, reject) => {
-                  setTimeout(() => {
-                    originalFetch.apply(window, [resource, init]).then(resolve, reject);
-                  }, delay);
-                });
-              }
+      const hrefDescriptor = Object.getOwnPropertyDescriptor(window.Location?.prototype, "href");
+      if (hrefDescriptor?.get && hrefDescriptor?.set && hrefDescriptor.configurable) {
+        Object.defineProperty(window.Location.prototype, "href", {
+          configurable: true,
+          enumerable: hrefDescriptor.enumerable ?? true,
+          get: hrefDescriptor.get,
+          set(value) {
+            if (shouldBlockNavigationTarget(value)) {
+              reportBlockedNavigation("location.href", value);
+              return;
             }
+            hrefDescriptor.set.call(this, value);
           }
-        } catch (_error) {
-          // Ignore guard check errors, fall through.
-        }
-
-        return originalFetch.apply(window, [resource, init]);
-      };
-
-      window.fetch.__facebergOriginal = originalFetch;
+        });
+      }
     } catch (_error) {
-      // Ignore if browser blocks overriding fetch.
+      /* Chrome normally exposes Location.href as non-configurable. */
     }
   }
 
-  function guardNavigationAPI() {
+  function guardHistoryRouteResets() {
+    for (const methodName of ["pushState", "replaceState"]) {
+      wrapMethod(
+        window.history,
+        methodName,
+        (_state, _unused, url) => url != null && shouldBlockNavigationTarget(url),
+        (_state, _unused, url) => {
+          reportBlockedNavigation(`history.${methodName}`, url);
+          return undefined;
+        }
+      );
+    }
+  }
+
+  function guardNavigationApi() {
     if (!window.navigation) {
       return;
     }
 
-    try {
-      if (typeof window.navigation.navigate === "function") {
-        const originalNavigate = window.navigation.navigate.bind(window.navigation);
-
-        window.navigation.navigate = function (url, options) {
-          if (url && shouldBlockNavigationTarget(url)) {
-            console.debug(BLOCK_MSG, "navigation.navigate", url);
-            reportStat("preventedRefreshes", 1);
-            const aborted = Promise.reject(new DOMException("Blocked by Faceberg", "AbortError"));
-            aborted.catch(() => {});
-            return { committed: aborted, finished: aborted };
-          }
-
-          return originalNavigate(url, options);
+    window.navigation.addEventListener("navigate", (event) => {
+      if (enabled && Date.now() < resumeGuardUntil) {
+        lastNavigationEvent = {
+          at: Date.now(),
+          cancelable: event.cancelable === true,
+          destination: event.destination?.url || "",
+          navigationType: event.navigationType || "",
+          userInitiated: event.userInitiated === true,
+          visibilityState: document.visibilityState
         };
-
-        window.navigation.navigate.__facebergOriginal = originalNavigate;
+        emitNavigationDiagnostic({
+          ...lastNavigationEvent,
+          guardActive: isAutomaticResumeNavigation(),
+          lastTrustedInteractionAt,
+          resumeGuardUntil
+        });
       }
-    } catch (_error) {
-      // Ignore if browser blocks overriding navigation.navigate.
+
+      if (
+        !isAutomaticResumeNavigation() ||
+        event.defaultPrevented ||
+        event.userInitiated === true ||
+        event.cancelable !== true
+      ) {
+        return;
+      }
+
+      const target = event.destination?.url || "";
+      const blocksReload = event.navigationType === "reload";
+      const blocksRouteReset = shouldBlockNavigationTarget(target);
+      if (!blocksReload && !blocksRouteReset) {
+        return;
+      }
+
+      event.preventDefault();
+      reportBlockedNavigation(
+        blocksReload ? "navigate-event:reload" : "navigate-event:route-reset",
+        target
+      );
+    }, true);
+
+    wrapMethod(
+      window.navigation,
+      "navigate",
+      (url) => shouldBlockNavigationTarget(url),
+      (url) => {
+        reportBlockedNavigation("navigation.navigate", url);
+        return createAbortedNavigationResult();
+      }
+    );
+    wrapMethod(
+      window.navigation,
+      "reload",
+      () => isAutomaticResumeNavigation(),
+      () => {
+        reportBlockedNavigation("navigation.reload");
+        return createAbortedNavigationResult();
+      }
+    );
+  }
+
+  function removeMetaRefresh(root = document) {
+    if (!enabled) {
+      return;
     }
 
-    try {
-      if (typeof window.navigation.reload === "function") {
-        const originalReload = window.navigation.reload.bind(window.navigation);
+    const candidates = [];
+    if (root instanceof HTMLMetaElement && root.hasAttribute("http-equiv")) {
+      candidates.push(root);
+    }
+    if (root instanceof Document || root instanceof Element) {
+      candidates.push(...root.querySelectorAll("meta[http-equiv]"));
+    }
 
-        window.navigation.reload = function () {
-          console.debug(BLOCK_MSG, "navigation.reload");
-          reportStat("preventedRefreshes", 1);
-          const aborted = Promise.reject(new DOMException("Blocked by Faceberg", "AbortError"));
-          aborted.catch(() => {});
-          return { committed: aborted, finished: aborted };
-        };
-
-        window.navigation.reload.__facebergOriginal = originalReload;
+    for (const meta of candidates) {
+      if ((meta.getAttribute("http-equiv") || "").toLowerCase() !== "refresh") {
+        continue;
       }
-    } catch (_error) {
-      // Ignore if browser blocks overriding navigation.reload.
+      meta.remove();
+      reportBlockedNavigation("meta-refresh", meta.getAttribute("content") || "");
     }
   }
 
-  guardLocationReload();
-  guardLocationNavigationMethods();
-  guardLocationHrefSetter();
-  guardHostLocationSetter(Window.prototype, "window");
-  guardHostLocationSetter(Document.prototype, "document");
-  guardWindowOpen();
-  guardNavigationAPI();
-  guardLocationPropertySetter("search", (value) => {
-    const nextUrl = new URL(window.location.href);
-    nextUrl.search = String(value ?? "");
-    return nextUrl;
-  });
-  guardLocationPropertySetter("pathname", (value) => {
-    const nextUrl = new URL(window.location.href);
-    nextUrl.pathname = String(value ?? nextUrl.pathname);
-    return nextUrl;
-  });
-  guardHistoryReloads();
-  guardFetch();
-  guardSuspiciousLifecycleListeners();
-  guardSuspiciousEventHandlerProperties();
-  guardStringTimeoutReload();
-  spoofVisibilityState();
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      wasHidden = true;
+      beginResumeGuard();
+      return;
+    }
+
+    if (wasHidden) {
+      wasHidden = false;
+      beginResumeGuard();
+    }
+  }, true);
+  window.addEventListener("pagehide", () => {
+    wasHidden = true;
+    beginResumeGuard();
+  }, true);
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted === true || wasHidden) {
+      wasHidden = false;
+      beginResumeGuard();
+    }
+  }, true);
+  window.addEventListener("freeze", () => {
+    wasHidden = true;
+    beginResumeGuard();
+  }, true);
+  window.addEventListener("resume", () => {
+    if (wasHidden) {
+      wasHidden = false;
+    }
+    beginResumeGuard();
+  }, true);
+  window.addEventListener("focus", () => {
+    if (wasHidden) {
+      wasHidden = false;
+      beginResumeGuard();
+    }
+  }, true);
+
+  for (const eventType of ["pointerdown", "keydown", "touchstart"]) {
+    document.addEventListener(eventType, noteTrustedInteraction, { capture: true, passive: true });
+  }
+
+  window.addEventListener("message", (event) => {
+    if (
+      event.source !== window ||
+      event.data?.source !== "faceberg" ||
+      event.data?.kind !== "anti-refresh-config"
+    ) {
+      return;
+    }
+
+    enabled = event.data.enabled === true;
+    lastConfigAt = Date.now();
+    if (!enabled) {
+      resumeGuardUntil = 0;
+      wasHidden = document.visibilityState === "hidden";
+      return;
+    }
+
+    removeMetaRefresh(document);
+  }, true);
+
+  guardExplicitReloads();
+  guardLocationMethods();
+  guardHistoryRouteResets();
+  guardNavigationApi();
   removeMetaRefresh();
 
-  document.addEventListener("visibilitychange", suppressResumeLifecycleEvent, true);
-  window.addEventListener("pageshow", suppressResumeLifecycleEvent, true);
-  document.addEventListener("click", () => { lastUserInteractionAt = Date.now(); }, { capture: true, passive: true });
-  document.addEventListener("keydown", () => { lastUserInteractionAt = Date.now(); }, { capture: true, passive: true });
-  document.addEventListener("touchstart", () => { lastUserInteractionAt = Date.now(); }, { capture: true, passive: true });
-  window.addEventListener("pagehide", suppressResumeLifecycleEvent, true);
-  window.addEventListener("freeze", suppressResumeLifecycleEvent, true);
-  window.addEventListener("focus", suppressResumeLifecycleEvent, true);
-  window.addEventListener("resume", suppressResumeLifecycleEvent, true);
-
-  // Block reload/navigation logic triggered by online/offline events
-  function blockOnlineOfflineReload(e) {
-    try {
-      e.stopImmediatePropagation();
-      e.stopPropagation();
-      e.preventDefault();
-      console.debug(BLOCK_MSG, "blocked online/offline event reload", e.type);
-      reportStat("preventedRefreshes", 1);
-    } catch {}
-  }
-  window.addEventListener("online", blockOnlineOfflineReload, true);
-  window.addEventListener("offline", blockOnlineOfflineReload, true);
-
-  // Override window.ononline/onoffline
-  try {
-    Object.defineProperty(window, "ononline", {
-      configurable: true,
-      enumerable: true,
-      get() { return null; },
-      set(fn) {
-        if (typeof fn === "function") {
-          console.debug(BLOCK_MSG, "blocked window.ononline assignment");
-          reportStat("preventedRefreshes", 1);
+  const metaObserver = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (node instanceof Element) {
+          removeMetaRefresh(node);
         }
       }
-    });
-    Object.defineProperty(window, "onoffline", {
-      configurable: true,
-      enumerable: true,
-      get() { return null; },
-      set(fn) {
-        if (typeof fn === "function") {
-          console.debug(BLOCK_MSG, "blocked window.onoffline assignment");
-          reportStat("preventedRefreshes", 1);
-        }
-      }
-    });
-  } catch {}
+    }
 
-  const observer = new MutationObserver(() => removeMetaRefresh());
-  observer.observe(document.documentElement || document, {
+    if (document.head && metaObserverTarget !== document.head) {
+      metaObserver.disconnect();
+      metaObserverTarget = document.head;
+      metaObserver.observe(metaObserverTarget, {
+        childList: true,
+        subtree: true
+      });
+    }
+  });
+  let metaObserverTarget = document.head || document.documentElement || document;
+  metaObserver.observe(metaObserverTarget, {
     childList: true,
-    subtree: true
+    subtree: metaObserverTarget === document.head
   });
 
+  window.__facebergAntiRefreshState = {
+    version: GUARD_VERSION,
+    get enabled() {
+      return enabled;
+    },
+    get active() {
+      return isAutomaticResumeNavigation();
+    },
+    get resumeGuardUntil() {
+      return resumeGuardUntil;
+    },
+    get lastTrustedInteractionAt() {
+      return lastTrustedInteractionAt;
+    },
+    get blockedNavigationCount() {
+      return blockedNavigationCount;
+    },
+    get lastConfigAt() {
+      return lastConfigAt;
+    },
+    get lastNavigationEvent() {
+      return lastNavigationEvent ? { ...lastNavigationEvent } : null;
+    }
+  };
 })();

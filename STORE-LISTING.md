@@ -2,7 +2,7 @@
 
 ## Extension Name
 
-Faceberg
+Faceberg – Block Facebook Auto-Refresh & Clean Feed
 
 ## Category
 
@@ -14,35 +14,52 @@ English
 
 ## Short Description
 
-Declutters Facebook by hiding selected modules, expanding visible content, applying your preferred root-group sort, and offering optional anti-refresh behavior.
+Block Facebook automatic feed refreshes, hide Sponsored posts, Reels and Stories, and expand posts, comments and replies.
 
 ## Detailed Description
 
-Faceberg modifies the Facebook web interface.
+Faceberg gives you a cleaner, more readable Facebook experience by blocking
+automatic feed refreshes, hiding selected feed clutter, and expanding content
+you would otherwise have to open manually.
 
-It can hide selected feed modules, including Reels, Stories, sponsored posts, People You May Know, and optional Follow and Join cards.
+Main features:
 
-It can expand visible truncated posts and visible comment threads. On supported post dialogs, direct post pages, and supported media comment surfaces, it can switch the comment view to All comments before expansion.
+- Blocks Facebook-initiated automatic feed refreshes while leaving manual
+  browser reloads available.
+- Hides Sponsored posts in the main feed and the right-column Sponsored module.
+- Removes Sponsored Reels and hides the Reels and Stories blocks.
+- Hides People You May Know, Follow, and Join suggestions.
+- Expands truncated posts, comment text, and nested replies.
+- Switches supported discussions to All comments.
+- Applies your preferred sorting option on supported root group feeds.
+- Lets you enable or disable each cleanup and expansion behavior independently.
 
-On root group feed pages, it can apply the user-selected default group sort from the popup, including Recent activity, New posts, or Most relevant.
+The popup also shows local activity counters and includes a Copy Debug
+Information action for troubleshooting.
 
-When enabled, anti-refresh protection reduces forced reload behavior when returning to a Facebook tab.
+Faceberg stores settings and activity counters locally in the browser. It does
+not transmit Facebook content to external servers.
 
-The popup also shows local activity counters and includes a Copy Debug Information action for troubleshooting.
+Faceberg is designed for the desktop Facebook website. Because Facebook changes
+its interface frequently, selectors and supported surfaces may evolve between
+releases.
 
-Faceberg stores settings and activity counters locally in the browser and does not transmit Facebook content to external servers.
+Faceberg is an independent browser extension and is not affiliated with,
+endorsed by, or sponsored by Meta or Facebook.
 
 ## Single Purpose Statement
 
-Faceberg modifies the Facebook web interface by hiding selected feed modules, expanding visible content, applying the selected root-group sort, and optionally reducing tab-return reloads.
+Faceberg customizes the Facebook web interface by blocking Facebook-initiated
+automatic feed refreshes, hiding selected feed clutter, and expanding posts,
+comments, and replies.
 
 ## Screenshot Captions
 
-1. Select feed and automation options in the popup.
-2. Feed cleanup removes selected modules like Reels and sponsored posts.
-3. Post and comment expansion opens visible truncated content and switches supported comment surfaces to All comments.
-4. Root group pages apply the selected default group sort from the popup.
-5. Activity counters and debug export are available in the popup.
+1. Block automatic feed refreshes and select each cleanup option independently.
+2. Hide Sponsored posts, Reels, Stories, and other selected feed clutter.
+3. Expand truncated posts, comments, and nested replies automatically.
+4. Switch supported discussions to All comments and choose a root-group sort.
+5. Review local activity counters or copy diagnostics from the popup.
 
 ## Support URL
 

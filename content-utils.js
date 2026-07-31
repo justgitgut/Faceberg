@@ -38,7 +38,7 @@
   const ENGLISH_UI_DICTIONARY = {
     seeMoreLabels: ["see more"],
     actionMenuLabels: ["actions for this post"],
-    commentWords: ["comment", "comments", "reply", "replies", "response", "responses"],
+    commentWords: ["comment", "comments", "reply", "replies", "response", "responses", "answer", "answers"],
     loadMoreVerbs: ["view", "see", "show"],
     moreWords: ["more"],
     sortKeywords: ["most relevant", "relevant", "all comments", "comments", "newest", "oldest", "top", "recent", "sorted", "all", "most"],
@@ -52,7 +52,7 @@
 
     return {
       seeMoreRegex: createPhraseRegex(ENGLISH_UI_DICTIONARY.seeMoreLabels, { exact: true, allowTrailingPunctuation: true }),
-      actionMenuRegex: createPhraseRegex(ENGLISH_UI_DICTIONARY.actionMenuLabels, { exact: true }),
+      actionMenuRegex: createPhraseRegex(ENGLISH_UI_DICTIONARY.actionMenuLabels),
       commentSummaryRegex: new RegExp(
         `\\d[\\d.,\\s]*\\s+(?:${commentWordsPattern})(?=$|\\s|[.,!?;:()\\[\\]{}])`,
         "iu"
@@ -114,7 +114,7 @@
       return false;
     }
 
-    const text = normalizeText(element.textContent || element.getAttribute("aria-label"));
+    const text = normalizeText(element.getAttribute("aria-label") || element.textContent);
     return !!text && uiMatchers.actionMenuRegex.test(text);
   }
 
@@ -180,8 +180,8 @@
     }
 
     const {
-      dispatchKeyboard = true,
-      dispatchSyntheticClick = true,
+      dispatchKeyboard = false,
+      dispatchSyntheticClick = false,
       dispatchNativeClick = true
     } = options;
 
@@ -214,21 +214,28 @@
 
     focusElementSafely(element);
 
-    if (typeof PointerEvent === "function") {
-      element.dispatchEvent(new PointerEvent("pointerover", { ...pointerOptions, buttons: 0 }));
-      element.dispatchEvent(new PointerEvent("pointerenter", { ...pointerOptions, bubbles: false, buttons: 0 }));
-      element.dispatchEvent(new PointerEvent("pointermove", { ...pointerOptions, buttons: 0 }));
-      element.dispatchEvent(new PointerEvent("pointerdown", pointerOptions));
-      element.dispatchEvent(new PointerEvent("pointerup", { ...pointerOptions, buttons: 0 }));
+    if (dispatchNativeClick) {
+      try {
+        if (typeof element.click === "function") {
+          element.click();
+          return true;
+        }
+      } catch {
+        // Ignore native click failures.
+      }
     }
 
-    element.dispatchEvent(new MouseEvent("mouseover", { ...mouseOptions, buttons: 0 }));
-    element.dispatchEvent(new MouseEvent("mouseenter", { ...mouseOptions, bubbles: false, buttons: 0 }));
-    element.dispatchEvent(new MouseEvent("mousemove", { ...mouseOptions, buttons: 0 }));
-    element.dispatchEvent(new MouseEvent("mousedown", mouseOptions));
-    element.dispatchEvent(new MouseEvent("mouseup", { ...mouseOptions, buttons: 0 }));
     if (dispatchSyntheticClick) {
+      if (typeof PointerEvent === "function") {
+        element.dispatchEvent(new PointerEvent("pointerover", { ...pointerOptions, buttons: 0 }));
+        element.dispatchEvent(new PointerEvent("pointerdown", pointerOptions));
+        element.dispatchEvent(new PointerEvent("pointerup", { ...pointerOptions, buttons: 0 }));
+      }
+
+      element.dispatchEvent(new MouseEvent("mousedown", mouseOptions));
+      element.dispatchEvent(new MouseEvent("mouseup", { ...mouseOptions, buttons: 0 }));
       element.dispatchEvent(new MouseEvent("click", { ...mouseOptions, buttons: 0 }));
+      return true;
     }
 
     if (dispatchKeyboard) {
@@ -246,19 +253,10 @@
         key: "Enter",
         code: "Enter"
       }));
+      return true;
     }
 
-    if (dispatchNativeClick) {
-      try {
-        if (typeof element.click === "function") {
-          element.click();
-        }
-      } catch {
-        // Ignore native click failures.
-      }
-    }
-
-    return true;
+    return false;
   }
 
   globalThis.FacebergContentUtils = Object.freeze({

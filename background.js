@@ -4,6 +4,8 @@
   const FEEDS_URL = "https://www.facebook.com/?filter=all&sk=h_chr&sorting_setting=CHRONOLOGICAL";
   const DEFAULT_SETTINGS = {
     enableAntiRefresh: false,
+    enableFeedFilter: true,
+    enableBlockSponsoredSidebar: true,
     enableGoDirectlyToFeeds: false,
     groupFeedDefaultSort: "new posts"
   };
@@ -11,8 +13,21 @@
     "*://www.facebook.com/*",
     "*://web.facebook.com/*"
   ];
+  const LEGACY_ANTI_REFRESH_SCRIPT_ID = "faceberg-anti-refresh";
+  const LEGACY_STALE_FEED_GUARD_SCRIPT_IDS = [
+    "faceberg-stale-feed-guard-v1",
+    "faceberg-facebook-module-guard-v2"
+  ];
+  const MODULE_GUARD_SCRIPT_ID = "faceberg-facebook-module-guard-v3";
+  const MODULE_GUARD_RESET_FILE = "module-guard-reset.js";
+  const MODULE_GUARD_ANTI_REFRESH_FILE =
+    "module-guard-enable-anti-refresh.js";
+  const MODULE_GUARD_FEED_FILTER_FILE =
+    "module-guard-enable-feed-filter.js";
+  const MODULE_GUARD_FILE = "stale-feed-guard.js";
+  const ANTI_REFRESH_DIAGNOSTICS_KEY = "antiRefreshDiagnostics";
+  const ANTI_REFRESH_CONFIG_KIND = "anti-refresh-config-v13";
   const CONTENT_SCRIPT_FILES = ["shared-stats.js", "content-utils.js", "content-debug.js", "content-feed.js", "content-comments.js", "content.js"];
-  const ANTI_REFRESH_SCRIPT_ID = "faceberg-anti-refresh";
   const SESSION_STATS_DEFAULTS = {
     sessionRemovedReels: 0,
     sessionRemovedFollowPosts: 0,
@@ -25,6 +40,7 @@
     sessionExpandedPosts: 0,
     sessionExpandedComments: 0
   };
+  let diagnosticsWriteQueue = Promise.resolve();
 
   async function resetSessionStats() {
     try {
@@ -37,35 +53,98 @@
     }
   }
 
-  async function syncAntiRefreshRegistration(enabled) {
-    try {
-      const existingScripts = await chrome.scripting.getRegisteredContentScripts({
-        ids: [ANTI_REFRESH_SCRIPT_ID]
-      });
-      const isRegistered = existingScripts.some((script) => script.id === ANTI_REFRESH_SCRIPT_ID);
+  async function removeLegacyAntiRefreshRegistration() {
+    await Promise.allSettled(
+      [
+        LEGACY_ANTI_REFRESH_SCRIPT_ID,
+        ...LEGACY_STALE_FEED_GUARD_SCRIPT_IDS
+      ].map((id) => {
+        return chrome.scripting.unregisterContentScripts({ ids: [id] });
+      })
+    );
+  }
 
-      if (enabled && !isRegistered) {
+  function getModuleGuardFiles(settings = {}) {
+    const files = [MODULE_GUARD_RESET_FILE];
+    if (settings.enableAntiRefresh === true) {
+      files.push(MODULE_GUARD_ANTI_REFRESH_FILE);
+    }
+    if (
+      settings.enableFeedFilter !== false &&
+      settings.enableBlockSponsoredSidebar !== false
+    ) {
+      files.push(MODULE_GUARD_FEED_FILTER_FILE);
+    }
+    return files.length > 1
+      ? [...files, MODULE_GUARD_FILE]
+      : [];
+  }
+
+  async function syncModuleGuardRegistration(settings) {
+    try {
+      const registrations = await chrome.scripting.getRegisteredContentScripts({
+        ids: [MODULE_GUARD_SCRIPT_ID]
+      });
+      const [registration] = registrations;
+      const desiredFiles = getModuleGuardFiles(settings);
+      const currentFiles = Array.isArray(registration?.js)
+        ? registration.js
+        : [];
+      const registrationMatches =
+        currentFiles.length === desiredFiles.length &&
+        currentFiles.every((file, index) => file === desiredFiles[index]);
+
+      if (registrationMatches) {
+        return;
+      }
+
+      if (registration) {
+        await chrome.scripting.unregisterContentScripts({
+          ids: [MODULE_GUARD_SCRIPT_ID]
+        });
+      }
+
+      if (desiredFiles.length > 0) {
         await chrome.scripting.registerContentScripts([
           {
-            id: ANTI_REFRESH_SCRIPT_ID,
+            id: MODULE_GUARD_SCRIPT_ID,
             matches: FACEBOOK_URL_PATTERNS,
-            js: ["injected.js"],
+            js: desiredFiles,
             runAt: "document_start",
             world: "MAIN",
             persistAcrossSessions: true
           }
         ]);
-        return;
-      }
-
-      if (!enabled && isRegistered) {
-        await chrome.scripting.unregisterContentScripts({
-          ids: [ANTI_REFRESH_SCRIPT_ID]
-        });
       }
     } catch (_error) {
-      /* Ignore registration failures and continue with fallback injection. */
+      /*
+        Registration is best-effort on older Chromium builds. Existing tabs
+        still receive the same guard through executeScript below.
+      */
     }
+  }
+
+  function queueAntiRefreshDiagnostic(field, detail, sender) {
+    diagnosticsWriteQueue = diagnosticsWriteQueue
+      .then(async () => {
+        const stored = await chrome.storage.local.get({
+          [ANTI_REFRESH_DIAGNOSTICS_KEY]: {}
+        });
+        const previous = stored[ANTI_REFRESH_DIAGNOSTICS_KEY] || {};
+        await chrome.storage.local.set({
+          [ANTI_REFRESH_DIAGNOSTICS_KEY]: {
+            ...previous,
+            [field]: {
+              ...(detail && typeof detail === "object" ? detail : {}),
+              receivedAt: Date.now(),
+              tabId: typeof sender?.tab?.id === "number" ? sender.tab.id : null
+            }
+          }
+        });
+      })
+      .catch(() => {
+        /* Diagnostics are best-effort and must never affect protection. */
+      });
   }
 
   async function readSettings() {
@@ -130,19 +209,60 @@
     }
   }
 
-  async function ensureAntiRefreshInjected(tabId) {
+  async function ensurePageGuardsInjected(tabId, settings) {
     if (typeof tabId !== "number" || tabId < 0) {
       return;
     }
 
     try {
+      const moduleGuardFiles = getModuleGuardFiles(settings);
+      if (moduleGuardFiles.length > 0) {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: moduleGuardFiles,
+          world: "MAIN"
+        });
+      }
       await chrome.scripting.executeScript({
         target: { tabId },
         files: ["injected.js"],
         world: "MAIN"
       });
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: (nextEnabled, configKind) => {
+          window.postMessage(
+            {
+              source: "faceberg",
+              kind: configKind,
+              enabled: nextEnabled === true
+            },
+            "*"
+          );
+        },
+        args: [
+          settings?.enableAntiRefresh === true,
+          ANTI_REFRESH_CONFIG_KIND
+        ]
+      });
     } catch (_error) {
       /* Ignore restricted pages, duplicate injection races, or transient tab states. */
+    }
+  }
+
+  async function notifyFacebergRouteChanged(tabId, url) {
+    if (typeof tabId !== "number" || !isFacebookUrl(url)) {
+      return;
+    }
+
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: "faceberg:route-changed",
+        url
+      });
+    } catch (_error) {
+      /* A document-start content script may still be loading its message listener. */
     }
   }
 
@@ -154,9 +274,7 @@
     try {
       const settings = await readSettings();
       await ensureFacebergInjected(tab.id);
-      if (settings.enableAntiRefresh === true) {
-        await ensureAntiRefreshInjected(tab.id);
-      }
+      await ensurePageGuardsInjected(tab.id, settings);
       await setTabDiscardable(tab.id, settings.enableAntiRefresh !== true);
     } catch (_error) {
       /* Ignore transient settings/read errors. */
@@ -203,7 +321,7 @@
   async function handleActivation() {
     try {
       const settings = await readSettings();
-      await syncAntiRefreshRegistration(settings.enableAntiRefresh === true);
+      await syncModuleGuardRegistration(settings);
       const tabs = await chrome.tabs.query({ url: FACEBOOK_URL_PATTERNS });
 
       await Promise.all(
@@ -211,9 +329,7 @@
           .filter((tab) => typeof tab.id === "number")
           .map(async (tab) => {
             await ensureFacebergInjected(tab.id);
-            if (settings.enableAntiRefresh === true) {
-              await ensureAntiRefreshInjected(tab.id);
-            }
+            await ensurePageGuardsInjected(tab.id, settings);
           })
       );
 
@@ -232,6 +348,8 @@
     });
   });
 
+  removeLegacyAntiRefreshRegistration();
+
   chrome.runtime.onStartup.addListener(() => {
     resetSessionStats().finally(() => {
       handleActivation();
@@ -248,7 +366,11 @@
       return;
     }
 
-    applyProtectionToTab({ ...tab, id: tabId, url });
+    applyProtectionToTab({ ...tab, id: tabId, url }).then(() => {
+      if (changeInfo.url) {
+        notifyFacebergRouteChanged(tabId, changeInfo.url);
+      }
+    });
   });
 
   chrome.tabs.onCreated.addListener((tab) => {
@@ -275,6 +397,16 @@
   });
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "faceberg:anti-refresh-boot") {
+      queueAntiRefreshDiagnostic("lastBoot", message.detail, sender);
+      return false;
+    }
+
+    if (message?.type === "faceberg:anti-refresh-navigation") {
+      queueAntiRefreshDiagnostic("lastNavigation", message.detail, sender);
+      return false;
+    }
+
     if (message?.type !== "faceberg:protect-tab") {
       return false;
     }
@@ -291,8 +423,21 @@
       return;
     }
 
-    if (changes.enableAntiRefresh || changes.enableGoDirectlyToFeeds) {
+    if (
+      changes.enableAntiRefresh ||
+      changes.enableFeedFilter ||
+      changes.enableBlockSponsoredSidebar ||
+      changes.enableGoDirectlyToFeeds
+    ) {
       handleActivation();
     }
   });
+
+  /*
+    A developer-mode extension reload restarts this worker while Facebook may be
+    hidden in another tab. Upgrade that tab immediately so its first return is
+    protected, instead of waiting for the activation event that arrives too
+    late to intercept the same visibility transition.
+  */
+  handleActivation();
 })();

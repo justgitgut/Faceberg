@@ -10,11 +10,8 @@
     return;
   }
 
-  const { normalizeText } = contentUtils;
   const DEBUG_COMMENT_AUTOMATION = true;
-  const DEBUG_COMMENT_AUTOMATION_CONSOLE = false;
-  const DEBUG_SUMMARY_ATTRIBUTE = "data-faceberg-debug-summary";
-
+  const DEBUG_COMMENT_AUTOMATION_CONSOLE = true;
   function createEmptyDebugSummary() {
     return {
       url: window.location.href,
@@ -38,21 +35,7 @@
       window.__FACEBERG_DEBUG_REPORT = () => JSON.parse(JSON.stringify(window.__FACEBERG_DEBUG_SUMMARY));
     }
 
-    syncDebugSummaryToPage(window.__FACEBERG_DEBUG_SUMMARY);
     return window.__FACEBERG_DEBUG_SUMMARY;
-  }
-
-  function syncDebugSummaryToPage(summary) {
-    const root = document.documentElement;
-    if (!root) {
-      return;
-    }
-
-    try {
-      root.setAttribute(DEBUG_SUMMARY_ATTRIBUTE, JSON.stringify(summary));
-    } catch {
-      // Ignore serialization or DOM update failures.
-    }
   }
 
   function describeElement(element) {
@@ -62,16 +45,14 @@
 
     const tagName = String(element.tagName || "").toLowerCase();
     const role = element.getAttribute("role");
-    const ariaLabel = normalizeText(element.getAttribute("aria-label"));
-    const text = normalizeText(element.textContent).slice(0, 80);
+    const ariaModal = element.getAttribute("aria-modal");
     const pagelet = element.getAttribute("data-pagelet");
 
     return [
       tagName || "element",
       role ? `[role="${role}"]` : "",
+      ariaModal ? `[aria-modal="${ariaModal}"]` : "",
       pagelet ? `[data-pagelet="${pagelet}"]` : "",
-      ariaLabel ? `aria="${ariaLabel}"` : "",
-      text ? `text="${text}"` : ""
     ].filter(Boolean).join(" ");
   }
 
@@ -166,7 +147,6 @@
 
     window.__FACEBERG_DEBUG_SUMMARY = summary;
     window.__FACEBERG_DEBUG_REPORT = () => JSON.parse(JSON.stringify(window.__FACEBERG_DEBUG_SUMMARY));
-    syncDebugSummaryToPage(summary);
     return summary;
   }
 
@@ -195,8 +175,7 @@
       const summary = updateDebugSummary(step, details);
 
       if (DEBUG_COMMENT_AUTOMATION_CONSOLE) {
-        console.log("[Faceberg]", payload);
-        console.log("[FacebergSummary]", summary);
+        console.log(`[Faceberg] ${JSON.stringify(payload)}`);
       }
     } catch {
       // Ignore console serialization failures.

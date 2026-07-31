@@ -557,8 +557,14 @@ body {
 
 .fb-toggle--indent:hover { background: #f0f2f5; }
 
-/* Hide native checkbox */
-.fb-toggle input[type="checkbox"] { display: none; }
+/* Keep the native checkbox keyboard-focusable while drawing the custom switch. */
+.fb-toggle input[type="checkbox"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
 
 /* Switch track */
 .fb-toggle-track {
@@ -586,6 +592,10 @@ body {
 
 .fb-toggle input:checked ~ .fb-toggle-track               { background: var(--fb-blue); }
 .fb-toggle input:checked ~ .fb-toggle-track .fb-toggle-thumb { left: 18px; }
+.fb-toggle input:focus-visible ~ .fb-toggle-track {
+  outline: 2px solid var(--fb-blue);
+  outline-offset: 2px;
+}
 
 .fb-toggle--disabled {
   cursor: not-allowed;

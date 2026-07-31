@@ -7,21 +7,57 @@
 
   window.__facebergContentScriptInstalled = true;
 
+  /*
+    Emergency diagnostic mode keeps the extension present without touching
+    Facebook's page. It remains available as a one-switch baseline if the
+    lightweight comment-only runtime regresses. Preserve the background ping
+    contract so tab activation never repeatedly reinjects the content bundle.
+  */
+  const COMPATIBILITY_SAFE_MODE = false;
+  if (COMPATIBILITY_SAFE_MODE) {
+    window.__FACEBERG_SAFE_MODE = Object.freeze({
+      active: true,
+      reason: "facebook-runtime-compatibility"
+    });
+
+    try {
+      chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+        if (message?.type === "faceberg:ping") {
+          sendResponse({ ok: true, safeMode: true });
+        } else if (message?.type === "faceberg:rerun") {
+          sendResponse({ ok: true, safeMode: true });
+        }
+        return false;
+      });
+    } catch (_error) {
+      /* Safe mode must remain inert if the extension context is unavailable. */
+    }
+
+    return;
+  }
+
   const DEFAULT_SETTINGS = {
-    enableAntiRefresh: true,
+    enableAntiRefresh: false,
     enableFeedFilter: true,
     enablePostExpansion: true,
+    enableCommentSortAll: true,
     enableCommentExpansion: true,
+    enableBlockSponsoredPosts: true,
+    enableBlockSponsoredSidebar: true,
+    enableBlockSponsoredReels: true,
     enableBlockReels: true,
+    enableBlockStories: true,
     enableBlockPeopleYouMayKnow: true,
     enableBlockFollowPosts: true,
     enableBlockJoinPosts: true,
+    enableCompactHiddenCards: true,
     enableGoDirectlyToFeeds: false,
     groupFeedDefaultSort: "new posts"
   };
   const sharedStats = globalThis.FacebergStats || {};
   const STATS_DEFAULTS = sharedStats.DEFAULT_STATS || {
     removedReels: 0,
+    removedSponsoredReels: 0,
     removedFollowPosts: 0,
     removedJoinPosts: 0,
     removedStories: 0,
@@ -34,6 +70,7 @@
   };
   const SESSION_STATS_DEFAULTS = sharedStats.SESSION_STATS_DEFAULTS || {
     sessionRemovedReels: 0,
+    sessionRemovedSponsoredReels: 0,
     sessionRemovedFollowPosts: 0,
     sessionRemovedJoinPosts: 0,
     sessionRemovedStories: 0,
@@ -44,13 +81,18 @@
     sessionExpandedPosts: 0,
     sessionExpandedComments: 0
   };
-  const STARTUP_STABILIZATION_DELAYS_MS = [120, 400, 1200];
+  /*
+    Destructive React-owned Home-feed cleanup remains disabled. Native post-body
+    expansion is safe to run independently because it activates only Facebook's
+    exact visible See more button and never mutates a feed-card wrapper.
+  */
+  const ENABLE_HOME_FEED_AUTOMATION = false;
+  const ENABLE_GLOBAL_PAGE_MUTATION_OBSERVER = false;
   const POST_EXPANDER_MAX_ATTEMPTS = 4;
   const POST_EXPANDER_RETRY_COOLDOWN_MS = 250;
   const getSessionStatKey = sharedStats.toSessionKey || ((statKey) => `session${statKey.charAt(0).toUpperCase()}${statKey.slice(1)}`);
   let settings = { ...DEFAULT_SETTINGS };
-  let antiRefreshInjected = false;
-  let statsFlushTimer = null;
+  let statsFlushQueued = false;
   let extensionContextValid = true;
   const pendingStatIncrements = {};
   /* Facebook may render a valid See more button before its live click handler is
@@ -58,6 +100,18 @@
      no-op press during startup hydration. */
   const postExpanderAttemptState = new WeakMap();
   let lastObservedUrl = window.location.href;
+  let runtimeReady = false;
+  let scrollSnapshotTimer = 0;
+  let scrollRestoreUntil = 0;
+  let lastUserScrollIntentAt = 0;
+  let lastTrustedFeedInteractionAt = 0;
+  let lastTrustedFeedInteractionUnit = null;
+  const RECENT_FEED_INTERACTION_WINDOW_MS = 1200;
+  const SCROLL_SNAPSHOT_STORAGE_KEY = "__facebergScrollSnapshotsV1";
+  const SCROLL_SNAPSHOT_MAX_AGE_MS = 2 * 60 * 1000;
+  const ANTI_REFRESH_NAVIGATION_EVENT = "__facebergAntiRefreshNavigation";
+  const SPA_NAVIGATION_EVENT = "__facebergSpaNavigationV1";
+  const ANTI_REFRESH_CONFIG_KIND = "anti-refresh-config-v13";
   const contentUtils = globalThis.FacebergContentUtils;
   if (!contentUtils) {
     return;
@@ -86,20 +140,46 @@
 
     const tagName = String(element.tagName || "").toLowerCase();
     const role = element.getAttribute("role");
-    const text = normalizeText(element.textContent || element.getAttribute("aria-label")).slice(0, 80);
-    return [tagName || "element", role ? `[role="${role}"]` : "", text ? `text="${text}"` : ""].filter(Boolean).join(" ");
+    const ariaModal = element.getAttribute("aria-modal");
+    const pagelet = element.getAttribute("data-pagelet");
+    return [
+      tagName || "element",
+      role ? `[role="${role}"]` : "",
+      ariaModal ? `[aria-modal="${ariaModal}"]` : "",
+      pagelet ? `[data-pagelet="${pagelet}"]` : ""
+    ].filter(Boolean).join(" ");
   });
   const debugCommentAutomation = typeof contentDebug.debugCommentAutomation === "function"
     ? contentDebug.debugCommentAutomation
     : () => {};
   const runtimeDeps = {
     getSettings: () => settings,
+    hasTrustedPageInteraction: () => lastUserScrollIntentAt > 0,
+    isRecentlyInteractedFeedUnit: (unit) => {
+      if (
+        !(unit instanceof Element) ||
+        !(lastTrustedFeedInteractionUnit instanceof Element) ||
+        Date.now() - lastTrustedFeedInteractionAt >
+          RECENT_FEED_INTERACTION_WINDOW_MS
+      ) {
+        return false;
+      }
+
+      return (
+        unit === lastTrustedFeedInteractionUnit ||
+        unit.contains(lastTrustedFeedInteractionUnit) ||
+        lastTrustedFeedInteractionUnit.contains(unit)
+      );
+    },
+    isCommentAutomationSuspended: () => commentAutomationSuspended,
     queueStatIncrement
   };
   const groupFeedSortState = {
     lastToggleAt: 0,
     lastSelectionAt: 0,
-    interactionUntil: 0
+    interactionUntil: 0,
+    retryFrameId: 0,
+    observer: null
   };
 
   function normalizeGroupFeedSortValue(value) {
@@ -150,6 +230,118 @@
 
   function getActiveReelCommentSurface(root = document) {
     return contentComments.getActiveReelCommentSurface?.(root) || null;
+  }
+
+  function isPostOrMediaNavigationHref(href) {
+    if (!href) {
+      return false;
+    }
+
+    try {
+      const url = new URL(href, window.location.href);
+      return url.origin === window.location.origin &&
+        /\/permalink\/|\/posts\/|\/story\.php|\/photo\/|\/videos\/|\/reel\//i.test(
+          url.pathname
+        );
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function shouldWakeCommentRuntimeFromClick(event) {
+    if (event?.isTrusted !== true || !(event.target instanceof Element)) {
+      return false;
+    }
+
+    const target = event.target;
+    if (target.closest('[data-ad-rendering-role="comment_button"]')) {
+      return true;
+    }
+
+    const control = target.closest(
+      '[role="button"], [role="link"], button, a[href], [tabindex]'
+    );
+    if (!(control instanceof Element)) {
+      return false;
+    }
+
+    const text = normalizeText(
+      control.getAttribute("aria-label") || control.textContent
+    );
+    if (
+      text === "comment" ||
+      text === "comments" ||
+      text.startsWith("leave a comment") ||
+      uiMatchers.commentSummaryRegex.test(text)
+    ) {
+      return true;
+    }
+
+    const link = control.matches("a[href]") ? control : control.closest("a[href]");
+    return isPostOrMediaNavigationHref(link?.getAttribute("href") || "");
+  }
+
+  function isTrustedFeedCardInteraction(event) {
+    if (event?.isTrusted !== true || !(event.target instanceof Element)) {
+      return false;
+    }
+
+    const control = event.target.closest(
+      'a[href], button, [role="button"], [role="link"], [tabindex]'
+    );
+    return (
+      control instanceof Element &&
+      !!control.closest('[role="main"], main') &&
+      !!control.closest('[data-virtualized], [aria-posinset], div[role="article"]')
+    );
+  }
+
+  function scheduleUserInitiatedCommentWake() {
+    commentWakeObserver?.disconnect();
+    if (commentWakeFrame) {
+      cancelAnimationFrame(commentWakeFrame);
+    }
+
+    const startingUrl = window.location.href;
+    const tryWake = (allowInlineSurface = false) => {
+      commentWakeFrame = 0;
+      if (!runtimeReady || document.visibilityState !== "visible") {
+        return;
+      }
+
+      const dialog = getVisiblePostDialog(document);
+      const routeSettled =
+        window.location.href !== startingUrl ||
+        isDirectPostPage() ||
+        isMediaViewerPage();
+      if (!(dialog instanceof Element) && !routeSettled && !allowInlineSurface) {
+        return;
+      }
+
+      commentWakeObserver?.disconnect();
+      commentWakeObserver = null;
+      feedAutomationSuspended = false;
+      if (dialog instanceof Element) {
+        commentAutomationSuspended = false;
+        debouncedRunAll(dialog);
+      } else if (routeSettled) {
+        armSpaCommentWake();
+      } else {
+        commentAutomationSuspended = false;
+        debouncedCommentAutomation();
+      }
+    };
+
+    commentWakeObserver = new MutationObserver(() => {
+      if (!commentWakeFrame) {
+        commentWakeFrame = requestAnimationFrame(() => tryWake(true));
+      }
+    });
+    commentWakeObserver.observe(document.body || document.documentElement, {
+      childList: true,
+      subtree: true
+    });
+    commentWakeFrame = requestAnimationFrame(() => tryWake(false));
   }
 
   function getVisiblePostDialog(root = document) {
@@ -203,27 +395,655 @@
     return contentFeed.runFeedCleanup(root, runtimeDeps);
   }
 
-  /* Mutation-driven scheduling infrastructure.
-     Instead of hardcoded setTimeout delays, we watch for actual DOM
-     mutations and react as soon as changes land. */
+  function runSponsoredFeedFiltering(root = document) {
+    if (isFeedAutomationBlocked()) {
+      return;
+    }
+
+    return contentFeed.runSponsoredFeedFiltering(root, runtimeDeps);
+  }
+
+  function runSidebarSponsoredFiltering(root = document) {
+    return contentFeed.runSidebarSponsoredFiltering?.(root, runtimeDeps);
+  }
+
+  function runSponsoredReelFiltering(root = document) {
+    return contentFeed.runSponsoredReelFiltering?.(root, runtimeDeps) || 0;
+  }
+
+  /* Mutation-driven scheduling infrastructure. Automation reacts to actual DOM
+     changes and coalesces work into the next rendering frame. */
   let pendingRunAllFrame = 0;
   let pendingAutomationFrame = 0;
-  let pendingRunAllRoot = null;
-  let startupPassTimeouts = [];
+  let pendingHomeFeedAutomationFrame = 0;
+  let pendingSponsoredFeedFiltering = false;
+  let pendingPostExpansion = false;
+  let feedAutomationSuspended = false;
+  let commentAutomationSuspended = false;
+  let pendingSidebarSponsoredFiltering = 0;
+  let observedSponsoredSidebar = null;
+  let sponsoredSidebarObserver = null;
+  let sponsoredSidebarLocatorObserver = null;
+  let observedSponsoredReelRoot = null;
+  let sponsoredReelObserver = null;
+  let observedHomeFeed = null;
+  let homeFeedObserver = null;
+  let homeFeedLocatorObserver = null;
+  let commentWakeObserver = null;
+  let commentWakeFrame = 0;
+  let closeDialogObserver = null;
+  let pendingSpaCommentUrl = "";
+  const pendingHomeFeedRoots = new Set();
+  let lastFullDocumentPassAt = 0;
+  const pendingRunAllRoots = new Set();
+  const runtimePerformance = {
+    addedElements: 0,
+    documentRuns: 0,
+    homeFeedImmediateLastDurationMs: 0,
+    homeFeedImmediateMaxDurationMs: 0,
+    homeFeedImmediateReason: "",
+    homeFeedImmediateRuns: 0,
+    homeFeedImmediateTotalDurationMs: 0,
+    homeFeedLocatorBatches: 0,
+    homeFeedMutationBatches: 0,
+    homeFeedRootChanges: 0,
+    homeFeedRootScore: 0,
+    lastDurationMs: 0,
+    localRuns: 0,
+    longTaskCount: 0,
+    longTaskMaxMs: 0,
+    longTaskTotalMs: 0,
+    maxDurationMs: 0,
+    mutationBatches: 0,
+    mutationRecords: 0,
+    runCount: 0,
+    sponsoredReelMutationBatches: 0,
+    sponsoredReelRootChanges: 0,
+    slowRunCount: 0,
+    spaMutationBatches: 0,
+    spaRouteWaitBatches: 0,
+    spaUrlChanges: 0,
+    runtimeStartedAt: 0,
+    totalDurationMs: 0
+  };
+  window.__FACEBERG_PERF_SUMMARY = runtimePerformance;
+
+  function hasVisibleModalDialog() {
+    return [...document.querySelectorAll('[role="dialog"][aria-modal="true"]')]
+      .some((dialog) => isVisible(dialog));
+  }
+
+  function isFeedAutomationBlocked() {
+    return (
+      feedAutomationSuspended ||
+      window.location.pathname !== "/" ||
+      hasVisibleModalDialog()
+    );
+  }
+
+  function runImmediateSponsoredFeedFiltering(root, reason = "") {
+    if (
+      !runtimeReady ||
+      !settings?.enableFeedFilter ||
+      document.visibilityState !== "visible" ||
+      isFeedAutomationBlocked()
+    ) {
+      return;
+    }
+
+    const startedAt = window.performance.now();
+    runSponsoredFeedFiltering(root);
+    const duration = window.performance.now() - startedAt;
+    runtimePerformance.homeFeedImmediateRuns += 1;
+    runtimePerformance.homeFeedImmediateTotalDurationMs += duration;
+    runtimePerformance.homeFeedImmediateLastDurationMs = duration;
+    runtimePerformance.homeFeedImmediateMaxDurationMs = Math.max(
+      runtimePerformance.homeFeedImmediateMaxDurationMs,
+      duration
+    );
+    runtimePerformance.homeFeedImmediateReason = reason;
+  }
+
+  function cancelPendingFeedAutomation() {
+    if (pendingHomeFeedAutomationFrame) {
+      cancelAnimationFrame(pendingHomeFeedAutomationFrame);
+      pendingHomeFeedAutomationFrame = 0;
+    }
+    pendingSponsoredFeedFiltering = false;
+    pendingPostExpansion = false;
+    pendingHomeFeedRoots.clear();
+  }
+
+  function suspendFeedAutomationForNavigation() {
+    feedAutomationSuspended = true;
+    cancelPendingFeedAutomation();
+  }
+
+  function suspendCommentAutomationForDialogClose(dialog) {
+    if (!(dialog instanceof Element)) {
+      return false;
+    }
+
+    commentAutomationSuspended = true;
+    pendingSpaCommentUrl = "";
+    watchForDialogClose(dialog);
+    return true;
+  }
+
+  function scheduleFeedAutomationResume() {
+    feedAutomationSuspended = false;
+    if (
+      runtimeReady &&
+      document.visibilityState === "visible" &&
+      window.location.pathname === "/" &&
+      !hasVisibleModalDialog()
+    ) {
+      scheduleSidebarSponsoredFiltering();
+      ensureHomeFeedObserver();
+    }
+  }
+
+  function scheduleSidebarSponsoredFiltering() {
+    if (
+      !runtimeReady ||
+      !settings?.enableFeedFilter ||
+      !settings?.enableBlockSponsoredSidebar ||
+      document.visibilityState !== "visible" ||
+      window.location.pathname !== "/" ||
+      hasVisibleModalDialog()
+    ) {
+      return;
+    }
+
+    if (pendingSidebarSponsoredFiltering) {
+      cancelAnimationFrame(pendingSidebarSponsoredFiltering);
+    }
+
+    pendingSidebarSponsoredFiltering = requestAnimationFrame(() => {
+      pendingSidebarSponsoredFiltering = 0;
+      if (
+        settings?.enableFeedFilter &&
+        settings?.enableBlockSponsoredSidebar &&
+        document.visibilityState === "visible" &&
+        window.location.pathname === "/" &&
+        !hasVisibleModalDialog()
+      ) {
+        runSidebarSponsoredFiltering(observedSponsoredSidebar || document);
+      }
+    });
+  }
+
+  function ensureSponsoredSidebarLocatorObserver() {
+    if (
+      !settings?.enableFeedFilter ||
+      !settings?.enableBlockSponsoredSidebar
+    ) {
+      return;
+    }
+
+    if (sponsoredSidebarLocatorObserver) {
+      return;
+    }
+
+    sponsoredSidebarLocatorObserver = new MutationObserver((mutations) => {
+      if (observedSponsoredSidebar?.isConnected) {
+        return;
+      }
+
+      const sidebarWasAdded = mutations.some((mutation) => {
+        return [...mutation.addedNodes].some((node) => {
+          return node instanceof Element && (
+            node.matches('[role="complementary"]') ||
+            !!node.querySelector('[role="complementary"]')
+          );
+        });
+      });
+      if (sidebarWasAdded) {
+        ensureSponsoredSidebarObserver();
+      }
+    });
+    sponsoredSidebarLocatorObserver.observe(
+      document.body || document.documentElement,
+      { childList: true, subtree: true }
+    );
+  }
+
+  function ensureSponsoredSidebarObserver() {
+    if (
+      !runtimeReady ||
+      !settings?.enableFeedFilter ||
+      !settings?.enableBlockSponsoredSidebar ||
+      document.visibilityState !== "visible" ||
+      window.location.pathname !== "/"
+    ) {
+      return;
+    }
+
+    const sidebar = document.querySelector('[role="complementary"]');
+    if (!(sidebar instanceof Element)) {
+      ensureSponsoredSidebarLocatorObserver();
+      return;
+    }
+
+    if (
+      observedSponsoredSidebar === sidebar &&
+      sponsoredSidebarObserver
+    ) {
+      scheduleSidebarSponsoredFiltering();
+      return;
+    }
+
+    sponsoredSidebarObserver?.disconnect();
+    observedSponsoredSidebar = sidebar;
+    sponsoredSidebarObserver = new MutationObserver(() => {
+      scheduleSidebarSponsoredFiltering();
+    });
+    sponsoredSidebarObserver.observe(sidebar, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["aria-label", "data-ad-rendering-role", "hidden"]
+    });
+    ensureSponsoredSidebarLocatorObserver();
+    scheduleSidebarSponsoredFiltering();
+  }
+
+  function stopSponsoredSidebarObservers() {
+    if (pendingSidebarSponsoredFiltering) {
+      cancelAnimationFrame(pendingSidebarSponsoredFiltering);
+      pendingSidebarSponsoredFiltering = 0;
+    }
+    sponsoredSidebarObserver?.disconnect();
+    sponsoredSidebarLocatorObserver?.disconnect();
+    sponsoredSidebarObserver = null;
+    sponsoredSidebarLocatorObserver = null;
+    observedSponsoredSidebar = null;
+  }
+
+  function isReelExperiencePath() {
+    return /\/reel(?:s)?(?:\/|$)/i.test(
+      String(window.location.pathname || "")
+    );
+  }
+
+  function getSponsoredReelObserverRoot() {
+    if (!isReelExperiencePath()) {
+      return null;
+    }
+
+    const candidates = [...document.querySelectorAll('main, [role="main"]')]
+      .filter((candidate) => {
+        return (
+          candidate instanceof Element &&
+          candidate.isConnected &&
+          isVisible(candidate) &&
+          candidate.querySelectorAll("video").length >= 1
+        );
+      })
+      .map((candidate) => {
+        const rect = candidate.getBoundingClientRect();
+        return {
+          candidate,
+          score:
+            candidate.querySelectorAll("video").length * 100 +
+            Math.min(100, Math.round((rect.width * rect.height) / 10000))
+        };
+      })
+      .sort((left, right) => right.score - left.score);
+
+    return candidates[0]?.candidate || null;
+  }
+
+  function stopSponsoredReelObserver() {
+    sponsoredReelObserver?.disconnect();
+    sponsoredReelObserver = null;
+    observedSponsoredReelRoot = null;
+    runSponsoredReelFiltering(document);
+  }
+
+  function ensureSponsoredReelObserver() {
+    const shouldRun =
+      runtimeReady &&
+      settings?.enableFeedFilter === true &&
+      settings?.enableBlockSponsoredReels === true &&
+      isReelExperiencePath();
+    if (!shouldRun) {
+      stopSponsoredReelObserver();
+      return;
+    }
+
+    const root = getSponsoredReelObserverRoot();
+    if (!(root instanceof Element)) {
+      sponsoredReelObserver?.disconnect();
+      sponsoredReelObserver = null;
+      observedSponsoredReelRoot = null;
+      return;
+    }
+
+    if (observedSponsoredReelRoot === root && sponsoredReelObserver) {
+      runSponsoredReelFiltering(root);
+      return;
+    }
+
+    sponsoredReelObserver?.disconnect();
+    observedSponsoredReelRoot = root;
+    runtimePerformance.sponsoredReelRootChanges += 1;
+    sponsoredReelObserver = new MutationObserver((mutations) => {
+      runtimePerformance.sponsoredReelMutationBatches += 1;
+      handlePotentialUrlChange();
+      if (
+        document.visibilityState !== "visible" ||
+        !settings?.enableFeedFilter ||
+        !settings?.enableBlockSponsoredReels ||
+        !isReelExperiencePath()
+      ) {
+        return;
+      }
+
+      const localRoots = new Set();
+      let shouldScanWholeReelRoot = false;
+      for (const mutation of mutations) {
+        const candidates = mutation.type === "childList"
+          ? [...mutation.addedNodes, mutation.target]
+          : [mutation.target];
+        for (const node of candidates) {
+          const element =
+            node instanceof Element ? node : node?.parentElement;
+          if (element instanceof Element && element.isConnected) {
+            localRoots.add(element);
+            if (
+              mutation.type === "childList" &&
+              (element.matches("video") || !!element.querySelector("video"))
+            ) {
+              shouldScanWholeReelRoot = true;
+            }
+          }
+        }
+      }
+
+      if (shouldScanWholeReelRoot || localRoots.size === 0) {
+        runSponsoredReelFiltering(root);
+        return;
+      }
+
+      for (const localRoot of localRoots) {
+        runSponsoredReelFiltering(localRoot);
+      }
+    });
+    sponsoredReelObserver.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: [
+        "aria-label",
+        "hidden",
+        "href",
+        "rel",
+        "target"
+      ]
+    });
+    runSponsoredReelFiltering(root);
+  }
+
+  function getHomeFeedObserverCandidateScore(candidate) {
+    if (!(candidate instanceof Element) || !isVisible(candidate)) {
+      return 0;
+    }
+
+    let score = 1;
+    const hasExactFeedHeading = [
+      ...candidate.querySelectorAll('h1, h2, h3, [role="heading"]')
+    ].some((heading) => normalizeText(heading.textContent) === "feed posts");
+    if (hasExactFeedHeading) {
+      score += 100;
+    }
+    if (candidate.querySelector("[aria-posinset], [data-virtualized]")) {
+      score += 40;
+    }
+    if (
+      candidate.querySelector(
+        'div[role="article"], [role="button"][aria-label^="Actions for this post" i]'
+      )
+    ) {
+      score += 30;
+    }
+    if (candidate.querySelector('[role="region"][aria-label="Create a post"]')) {
+      score += 10;
+    }
+    return score;
+  }
+
+  function getHomeFeedObserverRoot() {
+    if (window.location.pathname !== "/") {
+      return null;
+    }
+
+    const candidates = [...document.querySelectorAll('main, [role="main"]')]
+      .filter((candidate) => candidate instanceof Element && isVisible(candidate));
+    const rankedCandidates = candidates
+      .map((candidate) => ({
+        candidate,
+        score: getHomeFeedObserverCandidateScore(candidate)
+      }))
+      .sort((left, right) => right.score - left.score);
+    const bestCandidate = rankedCandidates[0];
+    const currentCandidate = rankedCandidates.find(({ candidate }) => {
+      return candidate === observedHomeFeed;
+    });
+    return (
+      currentCandidate && currentCandidate.score >= Number(bestCandidate?.score || 0)
+        ? currentCandidate.candidate
+        : bestCandidate?.candidate
+    ) || null;
+  }
+
+  function addedNodeMayContainFeedRoot(node) {
+    const element = node instanceof Element ? node : node?.parentElement;
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    if (
+      observedHomeFeed instanceof Element &&
+      observedHomeFeed.isConnected &&
+      observedHomeFeed.contains(element)
+    ) {
+      return false;
+    }
+
+    const selector = [
+      "main",
+      '[role="main"]',
+      "[aria-posinset]",
+      "[data-virtualized]",
+      'div[role="article"]',
+      '[role="button"][aria-label^="Actions for this post" i]'
+    ].join(", ");
+    return element.matches(selector) || !!element.querySelector(selector);
+  }
+
+  function ensureHomeFeedLocatorObserver() {
+    if (homeFeedLocatorObserver) {
+      return;
+    }
+
+    homeFeedLocatorObserver = new MutationObserver((mutations) => {
+      runtimePerformance.homeFeedLocatorBatches += 1;
+      if (window.location.pathname !== "/") {
+        return;
+      }
+
+      const shouldRecheckRoot = !observedHomeFeed?.isConnected || mutations.some((mutation) => {
+        return [...mutation.addedNodes].some((node) => {
+          return addedNodeMayContainFeedRoot(node);
+        });
+      });
+      if (shouldRecheckRoot) {
+        ensureHomeFeedObserver();
+      }
+    });
+    homeFeedLocatorObserver.observe(
+      document.body || document.documentElement,
+      { childList: true, subtree: true }
+    );
+  }
+
+  function ensureHomeFeedObserver() {
+    if (!runtimeReady || window.location.pathname !== "/") {
+      homeFeedObserver?.disconnect();
+      homeFeedObserver = null;
+      observedHomeFeed = null;
+      runtimePerformance.homeFeedRootScore = 0;
+      pendingHomeFeedRoots.clear();
+      return;
+    }
+
+    const feedRoot = getHomeFeedObserverRoot();
+    if (!(feedRoot instanceof Element)) {
+      ensureHomeFeedLocatorObserver();
+      return;
+    }
+    const feedRootScore = getHomeFeedObserverCandidateScore(feedRoot);
+    if (observedHomeFeed === feedRoot && homeFeedObserver) {
+      runtimePerformance.homeFeedRootScore = feedRootScore;
+      return;
+    }
+
+    homeFeedObserver?.disconnect();
+    observedHomeFeed = feedRoot;
+    runtimePerformance.homeFeedRootChanges += 1;
+    runtimePerformance.homeFeedRootScore = feedRootScore;
+    homeFeedObserver = new MutationObserver((mutations) => {
+      runtimePerformance.homeFeedMutationBatches += 1;
+      handlePotentialUrlChange();
+      if (
+        document.visibilityState !== "visible" ||
+        window.location.pathname !== "/" ||
+        isFeedAutomationBlocked()
+      ) {
+        return;
+      }
+
+      const batchRoots = new Set();
+      for (const mutation of mutations) {
+        const candidates = mutation.type === "childList"
+          ? [...mutation.addedNodes]
+          : [mutation.target];
+        for (const node of candidates) {
+          const element = node instanceof Element ? node : node.parentElement;
+          if (element instanceof Element) {
+            const localRoot =
+              element.closest('[aria-posinset], [data-virtualized], div[role="article"]') ||
+              element;
+            pendingHomeFeedRoots.add(localRoot);
+            batchRoots.add(localRoot);
+          }
+        }
+      }
+
+      if (pendingHomeFeedRoots.size > 0) {
+        /*
+          Do not defer native Sponsored hiding to a second animation frame.
+          Chromium variants can starve that frame while Facebook runs a dense
+          startup task chain. MutationObserver delivery is already coalesced;
+          process only this batch's card-local roots before returning to the
+          page, then leave post expansion on the normal frame scheduler.
+        */
+        for (const root of batchRoots) {
+          if (root.isConnected) {
+            runImmediateSponsoredFeedFiltering(root, "feed-mutation");
+          }
+        }
+        if (settings?.enablePostExpansion) {
+          scheduleVisiblePostExpansion();
+        } else {
+          pendingHomeFeedRoots.clear();
+        }
+      }
+    });
+    homeFeedObserver.observe(feedRoot, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["aria-label", "data-ad-rendering-role", "hidden"]
+    });
+    ensureHomeFeedLocatorObserver();
+    runImmediateSponsoredFeedFiltering(feedRoot, "feed-root-attached");
+  }
+
+  try {
+    const longTaskObserver = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        const duration = Number(entry.duration || 0);
+        runtimePerformance.longTaskCount += 1;
+        runtimePerformance.longTaskTotalMs += duration;
+        runtimePerformance.longTaskMaxMs = Math.max(runtimePerformance.longTaskMaxMs, duration);
+      }
+    });
+    longTaskObserver.observe({ type: "longtask", buffered: true });
+  } catch (_error) {
+    /* Long-task timing is optional in isolated extension worlds. */
+  }
+
+  function normalizeRunAllRoot(root) {
+    if (!(root instanceof Element)) {
+      return document;
+    }
+
+    return root.closest('[role="dialog"]') ||
+      root.closest('[data-virtualized], [aria-posinset], div[role="article"]') ||
+      root;
+  }
+
+  function addPendingRunAllRoot(root) {
+    const normalizedRoot = normalizeRunAllRoot(root);
+    if (normalizedRoot === document) {
+      pendingRunAllRoots.clear();
+      pendingRunAllRoots.add(document);
+      return;
+    }
+
+    if (pendingRunAllRoots.has(document)) {
+      return;
+    }
+
+    for (const existingRoot of [...pendingRunAllRoots]) {
+      if (existingRoot === normalizedRoot || existingRoot.contains(normalizedRoot)) {
+        return;
+      }
+      if (normalizedRoot.contains(existingRoot)) {
+        pendingRunAllRoots.delete(existingRoot);
+      }
+    }
+
+    pendingRunAllRoots.add(normalizedRoot);
+    if (pendingRunAllRoots.size > 24) {
+      const main = normalizedRoot.closest('[role="main"]');
+      pendingRunAllRoots.clear();
+      pendingRunAllRoots.add(main || document);
+    }
+  }
 
   function debouncedRunAll(root = document) {
-    if (root instanceof Element) {
-      pendingRunAllRoot = root;
-    } else if (!(pendingRunAllRoot instanceof Element)) {
-      pendingRunAllRoot = document;
+    if (!runtimeReady) {
+      return;
     }
+
+    addPendingRunAllRoot(root);
 
     if (pendingRunAllFrame) return;
     pendingRunAllFrame = requestAnimationFrame(() => {
-      const nextRoot = pendingRunAllRoot || document;
-      pendingRunAllRoot = null;
+      const nextRoots = [...pendingRunAllRoots];
+      pendingRunAllRoots.clear();
       pendingRunAllFrame = 0;
-      runAll(nextRoot);
+      for (const nextRoot of nextRoots) {
+        if (nextRoot === document || nextRoot.isConnected) {
+          runAll(nextRoot);
+        }
+      }
     });
   }
 
@@ -236,18 +1056,9 @@
   }
 
   function scheduleStartupStabilizationPasses() {
-    startupPassTimeouts.forEach((timeoutId) => window.clearTimeout(timeoutId));
-    startupPassTimeouts = [];
-
-    STARTUP_STABILIZATION_DELAYS_MS.forEach((delay) => {
-      const timeoutId = window.setTimeout(() => {
-        startupPassTimeouts = startupPassTimeouts.filter((value) => value !== timeoutId);
-        if (document.visibilityState === "visible") {
-          debouncedRunAll(document);
-        }
-      }, delay);
-      startupPassTimeouts.push(timeoutId);
-    });
+    ensureHomeFeedObserver();
+    ensureSponsoredSidebarObserver();
+    ensureSponsoredReelObserver();
   }
 
   async function readSettings() {
@@ -284,33 +1095,16 @@
       !!chrome.storage?.local;
   }
 
-  function injectMainWorldScript() {
-    if (antiRefreshInjected || !settings.enableAntiRefresh || !canUseExtensionApis()) {
-      return;
-    }
-
-    const existingScript = document.querySelector('script[data-faceberg-main-world="true"]');
-    if (existingScript) {
-      antiRefreshInjected = true;
-      return;
-    }
-
-    const script = document.createElement("script");
-    try {
-      script.src = chrome.runtime.getURL("injected.js");
-    } catch (error) {
-      markExtensionContextInvalid(error);
-      return;
-    }
-    script.async = false;
-    script.dataset.facebergMainWorld = "true";
-    script.addEventListener("load", () => script.remove(), { once: true });
-    script.addEventListener("error", () => script.remove(), { once: true });
-    (document.documentElement || document.head || document.body).appendChild(script);
-    antiRefreshInjected = true;
-  }
-
   function requestTabProtection() {
+    window.postMessage(
+      {
+        source: "faceberg",
+        kind: ANTI_REFRESH_CONFIG_KIND,
+        enabled: settings.enableAntiRefresh === true
+      },
+      "*"
+    );
+
     if (!settings.enableAntiRefresh || !canUseExtensionApis()) {
       return;
     }
@@ -332,16 +1126,17 @@
 
     pendingStatIncrements[statKey] = (pendingStatIncrements[statKey] || 0) + delta;
 
-    if (statsFlushTimer !== null) {
+    if (statsFlushQueued) {
       return;
     }
 
-    statsFlushTimer = window.setTimeout(() => {
-      statsFlushTimer = null;
+    statsFlushQueued = true;
+    queueMicrotask(() => {
+      statsFlushQueued = false;
       flushStats().catch(() => {
         /* Ignore storage write failures. */
       });
-    }, 250);
+    });
   }
 
   async function flushStats() {
@@ -397,20 +1192,34 @@
       return;
     }
 
+    if (
+      root === document &&
+      window.location.pathname === "/" &&
+      feedAutomationSuspended
+    ) {
+      return;
+    }
+
     const scope = root instanceof Element
       ? root.closest(
         '[data-ad-rendering-role="story_message"], [data-ad-rendering-role="story_body"], div[role="article"], [data-pagelet*="FeedUnit"], [aria-posinset], [data-virtualized]'
       ) || root
       : document;
+    const hasVisibleModalDialog = [...document.querySelectorAll('[role="dialog"][aria-modal="true"]')]
+      .some((dialog) => isVisible(dialog));
     const isDialogScope = scope instanceof Element && scope.matches('[role="dialog"]');
     const isDocumentPass = scope === document;
+    const isHomeFeedPass =
+      isDocumentPass &&
+      window.location.pathname === "/" &&
+      !hasVisibleModalDialog;
     const maxPriorityClicks = isDocumentPass ? 12 : 4;
-    const maxGenericClicks = isDialogScope ? 0 : (isDocumentPass ? 4 : 2);
+    const maxGenericClicks = isDialogScope || isHomeFeedPass ? 0 : (isDocumentPass ? 4 : 2);
     const prioritizedCandidateSelector = isDialogScope
       ? '[data-ad-rendering-role="story_message"] [role="button"][tabindex], [data-ad-rendering-role="story_body"] [role="button"][tabindex]'
       : '[data-ad-rendering-role="story_message"] [role="button"][tabindex], [data-ad-rendering-role="story_body"] [role="button"][tabindex], [data-ad-comet-preview="message"] [role="button"][tabindex]';
     const prioritizedCandidates = scope.querySelectorAll(prioritizedCandidateSelector);
-    const genericCandidates = isDialogScope
+    const genericCandidates = isDialogScope || isHomeFeedPass
       ? []
       : scope.querySelectorAll('[role="button"][tabindex]');
     const candidates = [];
@@ -484,11 +1293,25 @@
         return false;
       }
 
+      const viewportRect = button.getBoundingClientRect();
+      if (
+        viewportRect.width <= 0 ||
+        viewportRect.height <= 0 ||
+        viewportRect.bottom <= -80 ||
+        viewportRect.top >= window.innerHeight + 160
+      ) {
+        return false;
+      }
+
       if (button.getAttribute("tabindex") !== "0" || button.getAttribute("aria-hidden") === "true") {
         return false;
       }
 
       if (button.closest('[role="menu"], [role="toolbar"]')) {
+        return false;
+      }
+
+      if (button.closest('a[href], [role="link"], nav, [role="navigation"]')) {
         return false;
       }
 
@@ -624,7 +1447,9 @@
         continue;
       }
 
-      const text = normalizeText(candidate.textContent || candidate.getAttribute("aria-label"));
+      const text = normalizeText(
+        `${candidate.getAttribute("aria-label") || ""} ${candidate.textContent || ""}`
+      );
       if (!text || !/sort group feed by/i.test(text)) {
         continue;
       }
@@ -765,61 +1590,93 @@
       return false;
     }
 
-    const target = button.querySelector('[role="img"], [aria-hidden="true"], svg, i')?.parentElement || button.firstElementChild || button;
-    const clickTarget = target instanceof Element ? target : button;
-    const rect = clickTarget.getBoundingClientRect();
-    const clientX = rect.left + Math.max(4, Math.min(rect.width / 2, rect.width - 4));
-    const clientY = rect.top + Math.max(4, Math.min(rect.height / 2, rect.height - 4));
-    const pointerOptions = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      pointerId: 1,
-      pointerType: "mouse",
-      isPrimary: true,
-      button: 0,
-      buttons: 1,
-      clientX,
-      clientY
-    };
-    const mouseOptions = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      button: 0,
-      buttons: 1,
-      clientX,
-      clientY,
-      detail: 1,
-      view: window
-    };
-
     try {
-      clickTarget.focus?.({ preventScroll: true });
-
-      if (typeof PointerEvent === "function") {
-        clickTarget.dispatchEvent(new PointerEvent("pointerover", pointerOptions));
-        clickTarget.dispatchEvent(new PointerEvent("pointerenter", pointerOptions));
-        clickTarget.dispatchEvent(new PointerEvent("pointerdown", pointerOptions));
-      }
-
-      clickTarget.dispatchEvent(new MouseEvent("mouseover", mouseOptions));
-      clickTarget.dispatchEvent(new MouseEvent("mouseenter", mouseOptions));
-      clickTarget.dispatchEvent(new MouseEvent("mousedown", mouseOptions));
-      clickTarget.dispatchEvent(new MouseEvent("mouseup", mouseOptions));
-
-      if (typeof PointerEvent === "function") {
-        clickTarget.dispatchEvent(new PointerEvent("pointerup", {
-          ...pointerOptions,
-          buttons: 0
-        }));
-      }
-
-      clickTarget.dispatchEvent(new MouseEvent("click", mouseOptions));
+      button.click();
       return true;
     } catch (_error) {
-      return pressElement(clickTarget) || clickTarget !== button && pressElement(button);
+      return pressElement(button);
     }
+  }
+
+  function ensureHomeFeedAutomationFrame() {
+    if (
+      pendingHomeFeedAutomationFrame ||
+      !runtimeReady ||
+      isFeedAutomationBlocked()
+    ) {
+      return;
+    }
+
+    pendingHomeFeedAutomationFrame = requestAnimationFrame(() => {
+      pendingHomeFeedAutomationFrame = 0;
+      const shouldFilterSponsored = pendingSponsoredFeedFiltering;
+      const shouldExpandPosts = pendingPostExpansion;
+      pendingSponsoredFeedFiltering = false;
+      pendingPostExpansion = false;
+
+      if (isFeedAutomationBlocked()) {
+        pendingHomeFeedRoots.clear();
+        return;
+      }
+
+      const roots = [...pendingHomeFeedRoots]
+        .filter((root) => root === document || root.isConnected);
+      pendingHomeFeedRoots.clear();
+      if (roots.length === 0) {
+        roots.push(document);
+      }
+
+      for (const root of roots) {
+        if (shouldFilterSponsored && settings?.enableFeedFilter) {
+          runSponsoredFeedFiltering(root);
+        }
+        if (shouldExpandPosts && settings?.enablePostExpansion) {
+          expandPostBodies(root);
+        }
+      }
+    });
+  }
+
+  function scheduleVisiblePostExpansion() {
+    if (
+      !runtimeReady ||
+      !settings.enablePostExpansion ||
+      isFeedAutomationBlocked()
+    ) {
+      return;
+    }
+
+    pendingPostExpansion = true;
+    ensureHomeFeedAutomationFrame();
+  }
+
+  function sendAntiRefreshDiagnostic(type, detail) {
+    if (!canUseExtensionApis()) {
+      return;
+    }
+
+    try {
+      chrome.runtime.sendMessage({ type, detail }).catch((error) => {
+        markExtensionContextInvalid(error);
+      });
+    } catch (error) {
+      markExtensionContextInvalid(error);
+    }
+  }
+
+  function reportPageBoot() {
+    if (!settings.enableAntiRefresh) {
+      return;
+    }
+
+    const navigationEntry = window.performance?.getEntriesByType?.("navigation")?.[0];
+    sendAntiRefreshDiagnostic("faceberg:anti-refresh-boot", {
+      at: Date.now(),
+      documentWasDiscarded: document.wasDiscarded === true,
+      navigationType: navigationEntry?.type || "",
+      timeOrigin: Number(window.performance?.timeOrigin || 0),
+      url: window.location.href
+    });
   }
 
   function activateGroupFeedSortItem(item) {
@@ -827,74 +1684,18 @@
       return { activated: false, target: null };
     }
 
-    const candidates = [
-      item,
-      item.querySelector('span[dir="auto"]'),
-      item.querySelector('div > div > div > span[dir="auto"]'),
-      item.firstElementChild
-    ].filter((candidate, index, array) => candidate instanceof Element && isVisible(candidate) && array.indexOf(candidate) === index);
-
-    for (const candidate of candidates) {
-      const rect = candidate.getBoundingClientRect();
-      const clientX = rect.left + Math.max(4, Math.min(rect.width / 2, rect.width - 4));
-      const clientY = rect.top + Math.max(4, Math.min(rect.height / 2, rect.height - 4));
-      const pointerOptions = {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        pointerId: 1,
-        pointerType: "mouse",
-        isPrimary: true,
-        button: 0,
-        buttons: 1,
-        clientX,
-        clientY
+    try {
+      item.click();
+      return {
+        activated: true,
+        target: item
       };
-      const mouseOptions = {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        button: 0,
-        buttons: 1,
-        clientX,
-        clientY,
-        detail: 1,
-        view: window
-      };
-
-      try {
-        candidate.focus?.({ preventScroll: true });
-
-        if (typeof PointerEvent === "function") {
-          candidate.dispatchEvent(new PointerEvent("pointerover", pointerOptions));
-          candidate.dispatchEvent(new PointerEvent("pointerenter", pointerOptions));
-          candidate.dispatchEvent(new PointerEvent("pointerdown", pointerOptions));
-        }
-
-        candidate.dispatchEvent(new MouseEvent("mouseover", mouseOptions));
-        candidate.dispatchEvent(new MouseEvent("mouseenter", mouseOptions));
-        candidate.dispatchEvent(new MouseEvent("mousedown", mouseOptions));
-        candidate.dispatchEvent(new MouseEvent("mouseup", mouseOptions));
-
-        if (typeof PointerEvent === "function") {
-          candidate.dispatchEvent(new PointerEvent("pointerup", {
-            ...pointerOptions,
-            buttons: 0
-          }));
-        }
-
-        candidate.dispatchEvent(new MouseEvent("click", mouseOptions));
+    } catch (_error) {
+      if (pressElement(item)) {
         return {
           activated: true,
-          target: candidate
+          target: item
         };
-      } catch (_error) {
-        if (pressElement(candidate)) {
-          return {
-            activated: true,
-            target: candidate
-          };
-        }
       }
     }
 
@@ -904,8 +1705,48 @@
     };
   }
 
+  function clearGroupFeedSortRetry() {
+    if (groupFeedSortState.retryFrameId) {
+      cancelAnimationFrame(groupFeedSortState.retryFrameId);
+      groupFeedSortState.retryFrameId = 0;
+    }
+    groupFeedSortState.observer?.disconnect();
+    groupFeedSortState.observer = null;
+  }
+
+  function ensureGroupFeedSortObserver() {
+    if (groupFeedSortState.observer || !isRootGroupFeedPage(window.location.href)) {
+      return;
+    }
+
+    groupFeedSortState.observer = new MutationObserver(() => {
+      scheduleGroupFeedSortRetry();
+    });
+    groupFeedSortState.observer.observe(document.body || document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-checked", "aria-expanded", "aria-selected"]
+    });
+  }
+
+  function scheduleGroupFeedSortRetry() {
+    ensureGroupFeedSortObserver();
+    if (groupFeedSortState.retryFrameId) {
+      return;
+    }
+
+    groupFeedSortState.retryFrameId = requestAnimationFrame(() => {
+      groupFeedSortState.retryFrameId = 0;
+      if (document.visibilityState === "visible") {
+        debouncedRunAll(document);
+      }
+    });
+  }
+
   function ensureGroupFeedSort(root = document) {
     if (!isRootGroupFeedPage(window.location.href)) {
+      clearGroupFeedSortRetry();
       return "unavailable";
     }
 
@@ -913,6 +1754,7 @@
     const targetSort = normalizeGroupFeedSortValue(settings.groupFeedDefaultSort);
     const button = getGroupFeedSortButton(root);
     if (!(button instanceof Element)) {
+      ensureGroupFeedSortObserver();
       debugCommentAutomation("group-feed-sort-no-button", {
         target: describeElement(root instanceof Element ? root : document.body),
         url: window.location.href
@@ -930,7 +1772,8 @@
 
     if (currentValue === targetSort) {
       groupFeedSortState.interactionUntil = 0;
-      debugCommentAutomation("group-feed-sort-already-new-posts", {
+      clearGroupFeedSortRetry();
+      debugCommentAutomation("group-feed-sort-already-target", {
         target: describeElement(button),
         currentValue,
         targetSort
@@ -959,7 +1802,8 @@
       if (targetItem instanceof Element) {
         if (targetItem.getAttribute("aria-checked") === "true") {
           groupFeedSortState.interactionUntil = 0;
-          debugCommentAutomation("group-feed-sort-already-new-posts", {
+          clearGroupFeedSortRetry();
+          debugCommentAutomation("group-feed-sort-already-target", {
             target: describeElement(button),
             currentValue,
             targetSort,
@@ -983,7 +1827,8 @@
         if (activationResult.activated) {
           groupFeedSortState.lastSelectionAt = now;
           groupFeedSortState.interactionUntil = now + 1500;
-          debugCommentAutomation("group-feed-sort-selected-new-posts", {
+          scheduleGroupFeedSortRetry();
+          debugCommentAutomation("group-feed-sort-selection-dispatched", {
             target: describeElement(button),
             currentValue,
             targetSort,
@@ -995,6 +1840,7 @@
         }
 
         groupFeedSortState.interactionUntil = now + 800;
+        scheduleGroupFeedSortRetry();
         debugCommentAutomation("group-feed-sort-selection-failed", {
           target: describeElement(button),
           currentValue,
@@ -1005,7 +1851,7 @@
         });
         return "pending";
       } else {
-        debugCommentAutomation("group-feed-sort-no-new-posts-item", {
+        debugCommentAutomation("group-feed-sort-no-target-item", {
           target: describeElement(button),
           currentValue,
           targetSort,
@@ -1031,6 +1877,7 @@
     }
 
     if (groupFeedSortState.interactionUntil > now || now - groupFeedSortState.lastToggleAt < 600) {
+      ensureGroupFeedSortObserver();
       debugCommentAutomation("group-feed-sort-toggle-pending", {
         target: describeElement(button),
         currentValue,
@@ -1044,6 +1891,7 @@
     if (openGroupFeedSortMenu(button)) {
       groupFeedSortState.lastToggleAt = now;
       groupFeedSortState.interactionUntil = now + 1500;
+      scheduleGroupFeedSortRetry();
       debugCommentAutomation("group-feed-sort-toggle-opened", {
         target: describeElement(button),
         currentValue,
@@ -1062,48 +1910,84 @@
   }
 
   function runAll(root = document) {
-    ensureGroupFeedSort(root);
+    const startedAt = window.performance.now();
+    try {
+      ensureGroupFeedSort(root);
 
-    if (settings.enableAntiRefresh) {
-      injectMainWorldScript();
-      requestTabProtection();
-    }
-
-    const visibleDialog = getVisiblePostDialog(root);
-    if (visibleDialog) {
-      if (hasPostDialogSignals(visibleDialog) || hasCommentSurfaceSignals(visibleDialog)) {
-        expandPostBodies(visibleDialog);
-        scheduleCommentAutomationPasses(visibleDialog);
+      const hasDialogContext =
+        root === document ||
+        (root instanceof Element && (
+          !!root.closest('[role="dialog"]') ||
+          !!root.querySelector('[role="dialog"]') ||
+          !!document.querySelector('[role="dialog"][aria-modal="true"]')
+        ));
+      const visibleDialog = hasDialogContext ? getVisiblePostDialog(root) : null;
+      if (visibleDialog) {
+        if (hasPostDialogSignals(visibleDialog) || hasCommentSurfaceSignals(visibleDialog)) {
+          expandPostBodies(visibleDialog);
+          scheduleCommentAutomationPasses(visibleDialog);
+        }
+        return;
       }
-      return;
-    }
 
-    if (isMediaViewerPage() && getBlockingMediaViewerOverlay()) {
-      return;
-    }
+      if (isMediaViewerPage() && getBlockingMediaViewerOverlay()) {
+        return;
+      }
 
-    if (isDirectPostPage() || isMediaViewerPage()) {
-      expandPostBodies(getDirectPageExpansionRoot(root));
-      scheduleCommentAutomationPasses(document);
-      return;
-    }
+      if (isDirectPostPage() || isMediaViewerPage()) {
+        expandPostBodies(getDirectPageExpansionRoot(root));
+        scheduleCommentAutomationPasses(document);
+        return;
+      }
 
-    if (getActiveReelCommentSurface(root)) {
-      scheduleCommentAutomationPasses(document);
-      return;
-    }
+      if (isReelExperiencePath()) {
+        runSponsoredReelFiltering(root);
+        ensureSponsoredReelObserver();
+        if (getActiveReelCommentSurface(root)) {
+          scheduleCommentAutomationPasses(document);
+        }
+        return;
+      }
 
-    runFeedCleanup(root);
-    expandPostBodies(root);
+      if (getActiveReelCommentSurface(root)) {
+        scheduleCommentAutomationPasses(document);
+        return;
+      }
+
+      if (!ENABLE_HOME_FEED_AUTOMATION) {
+        expandPostBodies(root);
+        return;
+      }
+
+      runFeedCleanup(root);
+      expandPostBodies(root);
+    } finally {
+      const duration = window.performance.now() - startedAt;
+      runtimePerformance.runCount += 1;
+      runtimePerformance.totalDurationMs += duration;
+      runtimePerformance.lastDurationMs = duration;
+      runtimePerformance.maxDurationMs = Math.max(runtimePerformance.maxDurationMs, duration);
+      runtimePerformance.slowRunCount += Number(duration >= 16);
+      if (root === document) {
+        runtimePerformance.documentRuns += 1;
+      } else {
+        runtimePerformance.localRuns += 1;
+      }
+    }
   }
 
   function scheduleDocumentPasses() {
-    runAll(document);
+    if (!runtimeReady) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastFullDocumentPassAt >= 250) {
+      lastFullDocumentPassAt = now;
+      runAll(document);
+    }
     scheduleStartupStabilizationPasses();
-    /* The main MutationObserver at the end of the file reacts to
-       further DOM changes. Startup stabilization adds a few short
-       follow-up passes because Facebook often hydrates the first feed
-       post after the initial document pass. */
+    scheduleSponsoredFeedFiltering();
   }
 
   async function loadSettings() {
@@ -1111,14 +1995,20 @@
       const stored = await readSettings();
 
       settings = {
-        enableAntiRefresh: stored.enableAntiRefresh !== false,
+        enableAntiRefresh: stored.enableAntiRefresh === true,
         enableFeedFilter: stored.enableFeedFilter !== false,
         enablePostExpansion: stored.enablePostExpansion !== false,
+        enableCommentSortAll: stored.enableCommentSortAll !== false,
         enableCommentExpansion: stored.enableCommentExpansion !== false,
+        enableBlockSponsoredPosts: stored.enableBlockSponsoredPosts !== false,
+        enableBlockSponsoredSidebar: stored.enableBlockSponsoredSidebar !== false,
+        enableBlockSponsoredReels: stored.enableBlockSponsoredReels !== false,
         enableBlockReels: stored.enableBlockReels !== false,
+        enableBlockStories: stored.enableBlockStories !== false,
         enableBlockPeopleYouMayKnow: stored.enableBlockPeopleYouMayKnow !== false,
         enableBlockFollowPosts: stored.enableBlockFollowPosts !== false,
         enableBlockJoinPosts: stored.enableBlockJoinPosts !== false,
+        enableCompactHiddenCards: stored.enableCompactHiddenCards !== false,
         enableGoDirectlyToFeeds: stored.enableGoDirectlyToFeeds === true,
         groupFeedDefaultSort: normalizeGroupFeedSortValue(stored.groupFeedDefaultSort)
       };
@@ -1126,14 +2016,21 @@
       settings = { ...DEFAULT_SETTINGS };
     }
 
-    if (settings.enableAntiRefresh) {
-      injectMainWorldScript();
-    }
-
     requestTabProtection();
   }
 
   if (canUseExtensionApis()) {
+    document.addEventListener(ANTI_REFRESH_NAVIGATION_EVENT, (event) => {
+      let detail = null;
+      try {
+        detail = JSON.parse(String(event.detail || ""));
+      } catch (_error) {
+        return;
+      }
+
+      sendAntiRefreshDiagnostic("faceberg:anti-refresh-navigation", detail);
+    }, true);
+
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (message?.type === "faceberg:ping") {
         sendResponse({ ok: true });
@@ -1143,6 +2040,13 @@
       if (message?.type === "faceberg:rerun") {
         scheduleDocumentPasses();
         sendResponse({ ok: true });
+        return false;
+      }
+
+      if (message?.type === "faceberg:route-changed") {
+        handlePotentialUrlChange();
+        const armed = armSpaCommentWake(message.url);
+        sendResponse({ ok: true, armed });
         return false;
       }
 
@@ -1157,16 +2061,19 @@
       let shouldRerun = false;
 
       if (changes.enableAntiRefresh) {
-        settings.enableAntiRefresh = changes.enableAntiRefresh.newValue !== false;
-        if (settings.enableAntiRefresh) {
-          injectMainWorldScript();
-        }
+        settings.enableAntiRefresh = changes.enableAntiRefresh.newValue === true;
         requestTabProtection();
         shouldRerun = true;
       }
 
       if (changes.enableFeedFilter) {
         settings.enableFeedFilter = changes.enableFeedFilter.newValue !== false;
+        if (settings.enableFeedFilter && settings.enableBlockSponsoredSidebar) {
+          ensureSponsoredSidebarObserver();
+        } else {
+          stopSponsoredSidebarObservers();
+        }
+        ensureSponsoredReelObserver();
         shouldRerun = true;
       }
 
@@ -1180,8 +2087,40 @@
         shouldRerun = true;
       }
 
+      if (changes.enableCommentSortAll) {
+        settings.enableCommentSortAll = changes.enableCommentSortAll.newValue !== false;
+        shouldRerun = true;
+      }
+
+      if (changes.enableBlockSponsoredPosts) {
+        settings.enableBlockSponsoredPosts = changes.enableBlockSponsoredPosts.newValue !== false;
+        shouldRerun = true;
+      }
+
+      if (changes.enableBlockSponsoredSidebar) {
+        settings.enableBlockSponsoredSidebar = changes.enableBlockSponsoredSidebar.newValue !== false;
+        if (settings.enableBlockSponsoredSidebar && settings.enableFeedFilter) {
+          ensureSponsoredSidebarObserver();
+        } else {
+          stopSponsoredSidebarObservers();
+        }
+        shouldRerun = true;
+      }
+
+      if (changes.enableBlockSponsoredReels) {
+        settings.enableBlockSponsoredReels =
+          changes.enableBlockSponsoredReels.newValue !== false;
+        ensureSponsoredReelObserver();
+        shouldRerun = true;
+      }
+
       if (changes.enableBlockReels) {
         settings.enableBlockReels = changes.enableBlockReels.newValue !== false;
+        shouldRerun = true;
+      }
+
+      if (changes.enableBlockStories) {
+        settings.enableBlockStories = changes.enableBlockStories.newValue !== false;
         shouldRerun = true;
       }
 
@@ -1200,6 +2139,11 @@
         shouldRerun = true;
       }
 
+      if (changes.enableCompactHiddenCards) {
+        settings.enableCompactHiddenCards = changes.enableCompactHiddenCards.newValue !== false;
+        shouldRerun = true;
+      }
+
       if (changes.enableGoDirectlyToFeeds) {
         settings.enableGoDirectlyToFeeds = changes.enableGoDirectlyToFeeds.newValue === true;
         shouldRerun = true;
@@ -1211,7 +2155,8 @@
       }
 
       if (shouldRerun) {
-        runAll(document);
+        debouncedRunAll(document);
+        scheduleSponsoredFeedFiltering();
       }
     });
   }
@@ -1232,85 +2177,451 @@
     }
   });
 
-  /* Run one eager pass with defaults so first-feed expansion does not wait on
-     async storage reads during page startup. A second pass still runs after
-     settings load to apply the persisted configuration. */
-  scheduleDocumentPasses();
+  function getScrollSnapshotUrl() {
+    return `${window.location.origin}${window.location.pathname}${window.location.search}`;
+  }
 
-  loadSettings()
-    .then(() => {
-      scheduleDocumentPasses();
+  function readScrollSnapshots() {
+    try {
+      const parsed = JSON.parse(window.sessionStorage.getItem(SCROLL_SNAPSHOT_STORAGE_KEY) || "{}");
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (_error) {
+      return {};
+    }
+  }
+
+  function saveScrollSnapshot() {
+    scrollSnapshotTimer = 0;
+
+    try {
+      const url = getScrollSnapshotUrl();
+      const snapshots = readScrollSnapshots();
+      snapshots[url] = {
+        x: Math.max(0, Math.round(window.scrollX)),
+        y: Math.max(0, Math.round(window.scrollY)),
+        at: Date.now()
+      };
+
+      const recentEntries = Object.entries(snapshots)
+        .filter(([, value]) => value && Date.now() - Number(value.at || 0) <= SCROLL_SNAPSHOT_MAX_AGE_MS)
+        .sort((left, right) => Number(right[1].at || 0) - Number(left[1].at || 0))
+        .slice(0, 5);
+      window.sessionStorage.setItem(SCROLL_SNAPSHOT_STORAGE_KEY, JSON.stringify(Object.fromEntries(recentEntries)));
+    } catch (_error) {
+      /* Session storage can be unavailable in restricted browsing modes. */
+    }
+  }
+
+  function scheduleScrollSnapshot() {
+    if (Date.now() < scrollRestoreUntil) {
+      return;
+    }
+
+    if (scrollSnapshotTimer) {
+      cancelAnimationFrame(scrollSnapshotTimer);
+    }
+    scrollSnapshotTimer = requestAnimationFrame(saveScrollSnapshot);
+  }
+
+  function scheduleSponsoredFeedFiltering() {
+    if (!runtimeReady || isFeedAutomationBlocked()) {
+      return;
+    }
+
+    if (!settings?.enableFeedFilter) {
+      return;
+    }
+
+    pendingSponsoredFeedFiltering = true;
+    ensureHomeFeedAutomationFrame();
+  }
+
+  function restoreRecentScrollSnapshot() {
+    const snapshot = readScrollSnapshots()[getScrollSnapshotUrl()];
+    if (!snapshot ||
+        Date.now() - Number(snapshot.at || 0) > SCROLL_SNAPSHOT_MAX_AGE_MS ||
+        Number(snapshot.y || 0) < 80) {
+      return;
+    }
+
+    const restoreStartedAt = Date.now();
+    scrollRestoreUntil = Number.POSITIVE_INFINITY;
+    requestAnimationFrame(() => {
+      const userTookControl = lastUserScrollIntentAt > restoreStartedAt;
+      const maxScrollY = Math.max(
+        0,
+        (document.documentElement?.scrollHeight || document.body?.scrollHeight || 0) - window.innerHeight
+      );
+      const targetY = Math.min(Number(snapshot.y || 0), maxScrollY);
+
+      if (
+        !userTookControl &&
+        document.visibilityState === "visible" &&
+        targetY >= 80 &&
+        window.scrollY < targetY - 80
+      ) {
+        window.scrollTo(Number(snapshot.x || 0), targetY);
+      }
+
+      scrollRestoreUntil = 0;
+      saveScrollSnapshot();
     });
+  }
 
-  document.addEventListener("DOMContentLoaded", () => {
+  function noteUserScrollIntent(event) {
+    if (event?.isTrusted === true) {
+      lastUserScrollIntentAt = Date.now();
+      const target = event.target instanceof Element ? event.target : null;
+      const feedUnit = target?.closest(
+        "[data-virtualized], [aria-posinset], div[role=\"article\"]"
+      );
+      if (feedUnit instanceof Element) {
+        lastTrustedFeedInteractionAt = lastUserScrollIntentAt;
+        lastTrustedFeedInteractionUnit = feedUnit;
+      }
+    }
+  }
+
+  function handlePotentialUrlChange() {
+    const currentUrl = window.location.href;
+    if (currentUrl === lastObservedUrl) {
+      return false;
+    }
+
+    lastObservedUrl = currentUrl;
+    runtimePerformance.spaUrlChanges += 1;
+    if (isPostOrMediaNavigationHref(currentUrl)) {
+      commentAutomationSuspended = true;
+      pendingSpaCommentUrl = currentUrl;
+      tryCompletePendingSpaCommentWake();
+    } else {
+      pendingSpaCommentUrl = "";
+      const closingDialog = getVisiblePostDialog(document);
+      if (!suspendCommentAutomationForDialogClose(closingDialog)) {
+        commentAutomationSuspended = false;
+        debouncedRunAll(document);
+      }
+    }
+    if (window.location.pathname === "/") {
+      scheduleFeedAutomationResume();
+      ensureSponsoredSidebarObserver();
+      ensureHomeFeedObserver();
+      scheduleSponsoredFeedFiltering();
+    } else {
+      homeFeedObserver?.disconnect();
+      homeFeedObserver = null;
+      observedHomeFeed = null;
+    }
+    ensureSponsoredReelObserver();
+
+    return true;
+  }
+
+  /*
+    Facebook commits a post permalink before it replaces the previously opened
+    dialog. A one-shot URL wake therefore sees the old dialog, rejects it
+    correctly by post identity, and used to stop before the new surface arrived.
+    Keep only the expected URL armed and complete the wake on the first DOM
+    mutation that exposes a matching post surface.
+  */
+  function armSpaCommentWake(expectedUrl = window.location.href) {
+    const normalizedExpectedUrl = String(expectedUrl || "");
+    if (
+      !normalizedExpectedUrl ||
+      normalizedExpectedUrl !== window.location.href ||
+      !isPostOrMediaNavigationHref(normalizedExpectedUrl)
+    ) {
+      return false;
+    }
+
+    pendingSpaCommentUrl = normalizedExpectedUrl;
+    return tryCompletePendingSpaCommentWake();
+  }
+
+  function tryCompletePendingSpaCommentWake() {
+    if (!runtimeReady || !pendingSpaCommentUrl) {
+      return false;
+    }
+
+    if (window.location.href !== pendingSpaCommentUrl) {
+      pendingSpaCommentUrl = "";
+      return false;
+    }
+
+    const dialog = getVisiblePostDialog(document);
+    if (dialog instanceof Element) {
+      pendingSpaCommentUrl = "";
+      feedAutomationSuspended = false;
+      commentAutomationSuspended = false;
+      debouncedRunAll(dialog);
+      return true;
+    }
+
+    /*
+      A direct permalink can render as a page rather than a modal. Do not use
+      this fallback while any modal is visible, because that modal may still be
+      the stale feed post Facebook is in the process of replacing.
+    */
+    if (
+      !hasVisibleModalDialog() &&
+      (isDirectPostPage() || isMediaViewerPage()) &&
+      runCommentAutomation(document)
+    ) {
+      pendingSpaCommentUrl = "";
+      feedAutomationSuspended = false;
+      commentAutomationSuspended = false;
+      expandPostBodies(getDirectPageExpansionRoot(document));
+      scheduleCommentAutomationPasses(document);
+      return true;
+    }
+
+    return false;
+  }
+
+  function watchForDialogClose(dialog) {
+    if (!(dialog instanceof Element)) {
+      return;
+    }
+
+    closeDialogObserver?.disconnect();
+    const checkClosed = () => {
+      if (dialog.isConnected && isVisible(dialog)) {
+        return;
+      }
+
+      closeDialogObserver?.disconnect();
+      closeDialogObserver = null;
+      commentAutomationSuspended = false;
+      if (window.location.pathname === "/" && !hasVisibleModalDialog()) {
+        scheduleFeedAutomationResume();
+        ensureSponsoredSidebarObserver();
+        ensureHomeFeedObserver();
+      }
+    };
+
+    closeDialogObserver = new MutationObserver(checkClosed);
+    closeDialogObserver.observe(document.body || document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-hidden", "hidden", "style"]
+    });
+  }
+
+  function startRuntime() {
+    if (runtimeReady) {
+      return;
+    }
+
+    runtimeReady = true;
+    runtimePerformance.runtimeStartedAt = Date.now();
+    restoreRecentScrollSnapshot();
+    ensureSponsoredSidebarObserver();
+    ensureSponsoredReelObserver();
+    ensureHomeFeedObserver();
+    if (!(observedHomeFeed instanceof Element)) {
+      runImmediateSponsoredFeedFiltering(document, "startup-fallback");
+    }
     scheduleDocumentPasses();
+  }
+
+  loadSettings().then(() => {
+    reportPageBoot();
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", startRuntime, { once: true });
+    } else {
+      startRuntime();
+    }
   });
+
   window.addEventListener("load", () => {
-    scheduleDocumentPasses();
-  });
-  window.addEventListener("pageshow", () => {
-    scheduleDocumentPasses();
-  });
-  window.addEventListener("popstate", () => scheduleDocumentPasses());
-  window.addEventListener("hashchange", () => scheduleDocumentPasses());
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") {
+    if (runtimeReady) {
       scheduleDocumentPasses();
     }
+  });
+  window.addEventListener("pageshow", (event) => {
+    if (runtimeReady && event.persisted === true) {
+      scheduleDocumentPasses();
+    }
+  });
+  window.addEventListener("popstate", () => {
+    handlePotentialUrlChange();
+  });
+  window.addEventListener("hashchange", () => {
+    handlePotentialUrlChange();
+  });
+    window.addEventListener("scroll", () => {
+      scheduleScrollSnapshot();
+      scheduleSponsoredFeedFiltering();
+      scheduleVisiblePostExpansion();
+    }, { passive: true });
+    window.addEventListener("resize", () => {
+      scheduleSponsoredFeedFiltering();
+      scheduleVisiblePostExpansion();
+    }, { passive: true });
+  window.addEventListener("wheel", noteUserScrollIntent, { capture: true, passive: true });
+  window.addEventListener("touchstart", noteUserScrollIntent, { capture: true, passive: true });
+  window.addEventListener("pointerdown", (event) => {
+    const closeControl = event.target instanceof Element
+      ? event.target.closest('[role="button"][aria-label="Close" i]')
+      : null;
+    if (closeControl) {
+      const closingDialog =
+        closeControl.closest('[role="dialog"]') ||
+        getVisiblePostDialog(document);
+      if (suspendCommentAutomationForDialogClose(closingDialog)) {
+        return;
+      }
+    }
+
+    if (shouldWakeCommentRuntimeFromClick(event)) {
+      suspendFeedAutomationForNavigation();
+    } else if (isTrustedFeedCardInteraction(event)) {
+      cancelPendingFeedAutomation();
+    }
+  }, { capture: true, passive: true });
+  window.addEventListener("pointerdown", noteUserScrollIntent, { capture: true, passive: true });
+  window.addEventListener("keydown", noteUserScrollIntent, { capture: true, passive: true });
+  window.addEventListener("pagehide", saveScrollSnapshot);
+  document.addEventListener("click", (event) => {
+    if (shouldWakeCommentRuntimeFromClick(event)) {
+      suspendFeedAutomationForNavigation();
+      scheduleUserInitiatedCommentWake();
+      return;
+    }
+
+    const closeControl = event.target instanceof Element
+      ? event.target.closest('[role="button"][aria-label="Close" i]')
+      : null;
+    const closingDialog =
+      closeControl?.closest('[role="dialog"]') ||
+      (closeControl ? getVisiblePostDialog(document) : null);
+    if (closingDialog) {
+      suspendCommentAutomationForDialogClose(closingDialog);
+    }
+  }, { capture: true, passive: true });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      saveScrollSnapshot();
+    }
+    if (document.visibilityState === "visible") {
+      ensureSponsoredSidebarObserver();
+      ensureSponsoredReelObserver();
+      ensureHomeFeedObserver();
+      runImmediateSponsoredFeedFiltering(
+        observedHomeFeed || document,
+        "visibility-visible"
+      );
+      handlePotentialUrlChange();
+    }
+  });
+  document.addEventListener(SPA_NAVIGATION_EVENT, () => {
+    handlePotentialUrlChange();
+    armSpaCommentWake();
+  }, true);
+
+  /*
+    Facebook can replace the current permalink through its SPA router without
+    emitting popstate/hashchange/currententrychange in the content-script
+    world. This observer deliberately performs only an O(1) URL comparison;
+    unlike the retired global observer, it never scans mutation records or
+    feed nodes. A real route change schedules one coalesced document pass.
+  */
+  const spaUrlObserver = new MutationObserver(() => {
+    if (!runtimeReady) {
+      return;
+    }
+
+    runtimePerformance.spaMutationBatches += 1;
+    handlePotentialUrlChange();
+    if (
+      isReelExperiencePath() &&
+      (!observedSponsoredReelRoot?.isConnected || !sponsoredReelObserver)
+    ) {
+      ensureSponsoredReelObserver();
+    }
+    if (pendingSpaCommentUrl) {
+      runtimePerformance.spaRouteWaitBatches += 1;
+      tryCompletePendingSpaCommentWake();
+    }
+  });
+  spaUrlObserver.observe(document, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["aria-hidden", "aria-modal", "href", "role"]
   });
 
   const observer = new MutationObserver((mutations) => {
-    let hasNewElements = false;
-    let addedDialog = null;
+    if (!runtimeReady) {
+      return;
+    }
+
+    const addedElements = [];
+    const addedDialogs = [];
     for (const mutation of mutations) {
       if (mutation.type !== "childList") continue;
       for (const node of mutation.addedNodes) {
-        if (node.nodeType === Node.ELEMENT_NODE) {
-          hasNewElements = true;
-
-          const element = node;
-          if (element instanceof Element) {
-            if (element.matches('[role="dialog"]')) {
-              addedDialog = element;
-            } else {
-              const nestedDialog = element.querySelector?.('[role="dialog"]');
-              if (nestedDialog instanceof Element) {
-                addedDialog = nestedDialog;
-              }
-            }
+        if (!(node instanceof Element)) {
+          if (node.nodeType === 3 && mutation.target instanceof Element) {
+            addedElements.push(mutation.target);
           }
+          continue;
         }
+
+        addedElements.push(node);
+        if (node.matches('[role="dialog"]')) {
+          addedDialogs.push(node);
+        }
+        addedDialogs.push(...node.querySelectorAll('[role="dialog"]'));
       }
     }
-    if (!hasNewElements) return;
+    if (addedElements.length === 0) return;
+    runtimePerformance.mutationBatches += 1;
+    runtimePerformance.mutationRecords += mutations.length;
+    runtimePerformance.addedElements += addedElements.length;
 
-    /* Prefer the exact newly added dialog when Facebook opens comments/photo UI.
-       A broad document rescan here can reselect stale dialogs that are still visible underneath. */
-    if (addedDialog && isVisible(addedDialog)) {
+    /* Facebook frequently nests a full-screen shell dialog around the actual
+       aria-modal post dialog. Always choose the deepest modal so one comment
+       surface cannot acquire two competing automation controllers. */
+    const visibleDialogs = [...new Set(addedDialogs)]
+      .filter((dialog) => dialog.isConnected && isVisible(dialog))
+      .sort((left, right) => {
+        const modalDifference = Number(right.getAttribute("aria-modal") === "true") -
+          Number(left.getAttribute("aria-modal") === "true");
+        if (modalDifference !== 0) {
+          return modalDifference;
+        }
+
+        const getDepth = (element) => {
+          let depth = 0;
+          for (let current = element.parentElement; current; current = current.parentElement) {
+            depth += 1;
+          }
+          return depth;
+        };
+        return getDepth(right) - getDepth(left);
+      });
+    const addedDialog = visibleDialogs[0];
+    if (addedDialog) {
       debouncedRunAll(addedDialog);
       return;
     }
 
-    debouncedRunAll(document);
+    const connectedElements = addedElements.filter((element) => element.isConnected);
+    for (const element of connectedElements) {
+      debouncedRunAll(element);
+    }
   });
 
-  observer.observe(document.documentElement, {
-    childList: true,
-    subtree: true
-  });
+  if (ENABLE_GLOBAL_PAGE_MUTATION_OBSERVER) {
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true
+    });
+  }
 
-  /* Fallback heartbeat catches edge cases the MutationObserver may miss,
-     such as SPA navigation that only changes the URL without DOM mutations. */
-  window.setInterval(() => {
-    const currentUrl = window.location.href;
-    if (currentUrl !== lastObservedUrl) {
-      lastObservedUrl = currentUrl;
-      debouncedRunAll();
-      return;
-    }
-
-    if (document.visibilityState === "visible") {
-      debouncedRunAll();
-    }
-  }, 8000);
+  if (window.navigation?.addEventListener) {
+    window.navigation.addEventListener("currententrychange", handlePotentialUrlChange);
+  }
 })();

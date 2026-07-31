@@ -3,6 +3,7 @@
 
   const CLEANUP_STATS = [
     { key: "removedReels", label: "Reels removed" },
+    { key: "removedSponsoredReels", label: "Sponsored Reels removed" },
     { key: "removedFollowPosts", label: "Follow posts" },
     { key: "removedJoinPosts", label: "Join posts" },
     { key: "removedStories", label: "Stories removed" },

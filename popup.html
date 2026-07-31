@@ -48,32 +48,32 @@
 
               <div class="fb-setting-block">
                 <h3 class="fb-group-title">Expand Content</h3>
-                <p class="fb-group-copy">Automatically opens truncated posts and deeper comment threads.</p>
+                <p class="fb-group-copy">Choose how Faceberg opens truncated posts and comment discussions.</p>
                 <label class="fb-toggle">
                   <input id="enablePostExpansion" type="checkbox" />
                   <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
                   <span class="fb-toggle-label">Expand long posts</span>
                 </label>
                 <label class="fb-toggle">
+                  <input id="enableCommentSortAll" type="checkbox" />
+                  <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
+                  <span class="fb-toggle-label">Switch to <strong>All comments</strong></span>
+                </label>
+                <label class="fb-toggle">
                   <input id="enableCommentExpansion" type="checkbox" />
                   <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
-                  <span class="fb-toggle-label">Expand comment threads</span>
+                  <span class="fb-toggle-label">Expand replies and comment text</span>
                 </label>
               </div>
 
               <div class="fb-setting-block">
-                <h3 class="fb-group-title">Navigation</h3>
-                <p class="fb-group-copy">Where Facebook opens after applying changes.</p>
+                <h3 class="fb-group-title">Navigation &amp; Group Feeds</h3>
+                <p class="fb-group-copy">Choose where Facebook opens and the default sort for root group pages.</p>
                 <label class="fb-toggle">
                   <input id="enableGoDirectlyToFeeds" type="checkbox" />
                   <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
                   <span class="fb-toggle-label">Open on All Feed</span>
                 </label>
-              </div>
-
-              <div class="fb-setting-block">
-                <h3 class="fb-group-title">Group Feed Sort</h3>
-                <p class="fb-group-copy">Choose which sort Faceberg should apply on root group feed pages.</p>
                 <label class="fb-select-field" for="groupFeedDefaultSort">
                   <span class="fb-select-label">Default group sort</span>
                   <select id="groupFeedDefaultSort" class="fb-select-input">
@@ -88,7 +88,7 @@
             <div class="fb-settings-col fb-settings-col--right">
               <div class="fb-setting-block">
                 <h3 class="fb-group-title">Clean Up Feed</h3>
-                <p class="fb-group-copy">Hides Reels, Stories, Sponsored posts, People You May Know and other feed clutter.</p>
+                <p class="fb-group-copy">Choose exactly which feed distractions Faceberg should handle.</p>
                 <label class="fb-toggle">
                   <input id="enableFeedFilter" type="checkbox" />
                   <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
@@ -97,9 +97,33 @@
                 <p class="fb-dependent-note" id="feedCleanupNote">Turn on feed cleanup to configure filters.</p>
                 <div id="feedCleanupChildren">
                   <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter">
+                    <input id="enableBlockSponsoredPosts" type="checkbox" />
+                    <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
+                    <span class="fb-toggle-label">Hide <strong>Sponsored feed posts</strong></span>
+                  </label>
+                  <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter">
+                    <input id="enableBlockSponsoredSidebar" type="checkbox" />
+                    <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
+                    <span class="fb-toggle-label">Hide right-column <strong>Sponsored</strong></span>
+                  </label>
+                  <label
+                    class="fb-toggle fb-toggle--indent"
+                    data-parent-toggle="enableFeedFilter"
+                    title="Removes Sponsored items from the full-screen Reels feed."
+                  >
+                    <input id="enableBlockSponsoredReels" type="checkbox" />
+                    <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
+                    <span class="fb-toggle-label">Remove <strong>Sponsored Reels</strong></span>
+                  </label>
+                  <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter">
                     <input id="enableBlockReels" type="checkbox" />
                     <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
                     <span class="fb-toggle-label">Hide <strong>Reels</strong></span>
+                  </label>
+                  <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter">
+                    <input id="enableBlockStories" type="checkbox" />
+                    <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
+                    <span class="fb-toggle-label">Hide <strong>Stories</strong></span>
                   </label>
                   <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter">
                     <input id="enableBlockPeopleYouMayKnow" type="checkbox" />
@@ -116,13 +140,21 @@
                     <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
                     <span class="fb-toggle-label">Hide <strong>Join</strong> posts</span>
                   </label>
+                  <label
+                    class="fb-toggle fb-toggle--indent"
+                    data-parent-toggle="enableFeedFilter"
+                    title="Collapses Facebook's Ad hidden and Post hidden feedback after native hiding."
+                  >
+                    <input id="enableCompactHiddenCards" type="checkbox" />
+                    <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
+                    <span class="fb-toggle-label">Compact hidden feedback <strong>(experimental)</strong></span>
+                  </label>
                 </div>
               </div>
             </div>
 
           </div>
         </section>
-        <p class="fb-apply-note">Applying changes refreshes open Facebook tabs.</p>
       </section>
 
       <section class="fb-panel" id="activityPanel" data-tab-panel hidden aria-label="Activity tab">
@@ -190,9 +222,9 @@
             <div class="fb-about-features">
               <h3 class="fb-about-subtitle">What it does</h3>
               <ul class="fb-about-list">
-                <li><strong>Feed cleanup</strong> &mdash; hides Reels, Stories, Sponsored posts, "People you may know", and other clutter so you only see what matters.</li>
-                <li><strong>Auto-expand</strong> &mdash; opens truncated posts, loads deeper comment threads, and switches to "All comments" automatically.</li>
-                <li><strong>Anti-refresh</strong> &mdash; stops Facebook from silently reloading the page when you switch tabs, preserving your scroll position.</li>
+                <li><strong>Feed cleanup</strong> &mdash; independently controls Sponsored feed posts, the right-column Sponsored module, Sponsored Reels, Reels, Stories, Follow and Join suggestions, and other feed clutter.</li>
+                <li><strong>Auto-expand</strong> &mdash; independently controls truncated posts, deeper comment threads, and automatic "All comments" selection.</li>
+                <li><strong>Anti-refresh</strong> &mdash; blocks automatic resume reload attempts and restores a recent scroll position after an unexpected reload.</li>
               </ul>
             </div>
 
