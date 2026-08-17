@@ -46,7 +46,7 @@ Faceberg customizes the Facebook web interface by hiding selected feed modules, 
 
 ## Support URL
 
-https://github.com/justgitgut/Faceberg/issues
+https://github.com/justgitgut/Faceberg/issues/
 
 ## Privacy Policy URL
 

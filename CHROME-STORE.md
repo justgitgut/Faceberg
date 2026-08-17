@@ -26,7 +26,7 @@ This repository is prepared for packaging, but Chrome Web Store publication stil
 - Listing copy: [STORE-LISTING.md](STORE-LISTING.md)
 - Privacy policy: [PRIVACY.md](PRIVACY.md)
 - Privacy questionnaire answers: [PRIVACY-QUESTIONNAIRE.md](PRIVACY-QUESTIONNAIRE.md)
-- Suggested support URL: `https://github.com/justgitgut/Faceberg/issues`
+- Suggested support URL: `https://github.com/justgitgut/Faceberg/issues/`
 - Suggested privacy-policy URL if GitHub Pages is enabled: `https://justgitgut.github.io/Faceberg/privacy/`
 
 ## Permission justifications

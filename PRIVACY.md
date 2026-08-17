@@ -71,4 +71,4 @@ You can:
 
 Support and privacy questions can be directed to the public issue tracker:
 
-- `https://github.com/justgitgut/Faceberg/issues`
+- `https://github.com/justgitgut/Faceberg/issues/`

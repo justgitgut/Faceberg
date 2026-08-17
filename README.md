@@ -13,21 +13,27 @@ Chrome extension that declutters your Facebook feed, auto-expands posts and visi
   stale-Home, pushed-post-close, maintained-route feed cleanup, and independent
   right-column Sponsored renderer/refetch modules.
 - Prevents the independent Sponsored sidebar component from rendering or
-  running its visibility-return refetch hook, and activates Facebook's own
-  `Hide post`/`Hide ad` control for detected main-feed ads. The experimental
-  compact-feedback option keeps Facebook's outer virtualized unit connected
-  while reducing the confirmed inner `Ad hidden`/`Post hidden` payload to a
-  one-pixel inert box. A verified ad already inside the first viewport is
-  handled before the first trusted user input; later visible cards retain the
-  stricter click-routing safety gate.
+  running its visibility-return refetch hook. Verified main-feed Sponsored,
+  Follow, and Join cards are suppressed only after a stable permalink or
+  Facebook context identity is available. Sponsored detection scans all mounted
+  cards below the viewport safety buffer; a stable first-viewport ad may be
+  suppressed only during a bounded startup window before any trusted input.
+  The outer virtualized unit remains connected, and suppression is removed as
+  soon as Facebook drops or changes that identity while recycling the unit.
+  Faceberg does not use native Hide, visible placeholders, pre-paint card CSS,
+  or scroll compensation.
 - Auto-expands truncated posts and visible comment/reply threads.
 - Switches the active post dialog, direct post page, or supported media comment
   surface to `All comments` before expanding visible comment threads.
+- Binds Reel comment automation to the exact current `/reel/<id>` context so a
+  recycled sidebar from a previously viewed Reel cannot retain ownership.
 - Optionally disables Facebook's internal stale-feed reset hooks, blocks
   automatic same-page or route-reset navigation attempts during tab resume,
   and restores a recent scroll position after an unexpected reload.
 - Optionally lands you directly on the All Feed view with chronological sorting when opening Facebook.
 - Adds a popup action to copy extension debug information for troubleshooting.
+- Shows the current release notes and an expandable recent changelog in the
+  popup's About tab.
 
 ## Install (Developer Mode)
 
@@ -59,7 +65,8 @@ Chrome extension that declutters your Facebook feed, auto-expands posts and visi
 	- Enable feed cleanup
 	- Hide Sponsored feed posts
 	- Hide the right-column Sponsored module
-	- Remove Sponsored Reels from the full-screen Reels feed
+	- Remove Sponsored Reels from the full-screen Reels feed using early ad CTA
+	  evidence while keeping native Reel navigation synchronized
 	- Hide Reels modules
 	- Hide the Stories tray
 	- Hide People You May Know
@@ -75,7 +82,8 @@ Chrome extension that declutters your Facebook feed, auto-expands posts and visi
 
 When you open a root group page such as `https://www.facebook.com/groups/<group-id>` or `https://www.facebook.com/groups/<group-id>/`, Faceberg looks for the in-page group feed sorter and switches it to the configured default sort (`Recent activity`, `New posts`, or `Most relevant`). This works on direct loads and SPA navigation back to the root group feed.
 
-Note: anti-refresh protection is off by default and should be treated as an optional compatibility feature.
+Anti-refresh protection is on by default. You can turn it off independently if
+you prefer Facebook's native resume behavior.
 
 The extension auto-refreshes open Facebook tabs on install/update so filters apply immediately.
 
@@ -87,6 +95,8 @@ The extension auto-refreshes open Facebook tabs on install/update so filters app
 - The extension stores settings and aggregate counters locally and does not send Facebook data to external servers.
 - Session counters reset once per browser startup or extension restart; they do not reset on ordinary Facebook page loads.
 - The Activity tab includes `Copy Debug Information`, which copies extension version, active Facebook tab info, saved settings, activity stats, and page-debug extraction hints to the clipboard.
+- The About tab includes the current release notes and a compact history of
+  recent releases.
 
 ## How It Works
 
@@ -107,26 +117,28 @@ The extension auto-refreshes open Facebook tabs on install/update so filters app
   cannot starve cleanup. Exact standalone Reels and Stories module roots are
   hidden with a reversible marker while their React-owned nodes remain
   connected; other work is coalesced into the next rendering frame.
-- `popup.html` + `popup.js`: UI and storage-backed settings for feature toggles, grouped activity stats, period switching, saved-time estimates, and debug-information export.
+- `popup.html` + `popup.js`: UI and storage-backed settings for feature toggles, grouped activity stats, period switching, saved-time estimates, debug-information export, and the in-extension changelog.
 - `manifest.json`: MV3 config and script registration.
 
 ## Automation Boundary
 
 - Main-feed cleanup leaves React-owned outer feed units intact so Facebook
   retains native scrolling, loading, click routing, and media controls.
-  Experimental feedback compaction collapses the direct inner root before the
-  native hide click. A Sponsored card that hydrates late in a slow browser uses
-  the same inner-root-only boundary without invoking native Hide, and is
-  restored before paint if React recycles the unit for ordinary content.
+  Sponsored, Follow, and Join cards use a verified inner-root-only suppression
+  boundary without invoking native Hide and are restored before paint if React
+  recycles the unit for ordinary content. Experimental feedback compaction is
+  limited to already-rendered native hidden-feedback payloads.
 - Reels and Stories are treated as standalone modules rather than ordinary post
   cards. Faceberg hides only roots that pass exact structural checks, keeps
   those roots connected to React, and removes the marker immediately when the
   setting is disabled or Facebook recycles the node.
-- Sponsored Reels use a separate full-screen viewer boundary. Faceberg requires
-  one exact `Sponsored` label inside the Reel video player, one video in the
-  item, multiple sibling Reel videos, and an outbound ad destination. An active
-  or preloaded match is removed from the Reel scroll-snap layout while its React
-  node stays connected. Reinserted matching items are removed again.
+- Sponsored Reels use a separate full-screen viewer boundary. Faceberg accepts
+  a compact `Ad`/`Sponsored` badge or a known ad CTA such as `Play game`, but
+  only with Facebook's external redirect or a genuinely non-Facebook
+  destination. It still requires one item video, multiple sibling Reel videos,
+  and viewport-sized geometry. Active ads advance through Facebook's native
+  Next control so the URL and comments remain synchronized; preloaded off-screen
+  ads can be suppressed before entry.
 - Post expansion clicks visible `See more`-style controls.
 - Comment automation remains scoped to the current post context.
 - In already-open post dialogs, direct post pages, and supported media comment

@@ -8,7 +8,7 @@
   ];
 
   const DEFAULT_SETTINGS = {
-    enableAntiRefresh: false,
+    enableAntiRefresh: true,
     enableFeedFilter: true,
     enablePostExpansion: true,
     enableCommentSortAll: true,
@@ -535,15 +535,20 @@
   }
 
   async function readSettings() {
+    const settingKeys = Object.keys(DEFAULT_SETTINGS);
     const [syncResult, localResult] = await Promise.allSettled([
-      chrome.storage.sync.get(DEFAULT_SETTINGS),
-      chrome.storage.local.get(DEFAULT_SETTINGS)
+      chrome.storage.sync.get(settingKeys),
+      chrome.storage.local.get(settingKeys)
     ]);
 
     const syncSettings = syncResult.status === "fulfilled" ? syncResult.value : {};
     const localSettings = localResult.status === "fulfilled" ? localResult.value : {};
 
-    /* Prefer sync when available, fallback to local for reliability. */
+    /*
+      Prefer values actually stored in sync, with local as the fallback. Asking
+      each area to inject defaults here makes a missing sync key overwrite a
+      real local value after a partial write failure.
+    */
     return {
       ...DEFAULT_SETTINGS,
       ...localSettings,

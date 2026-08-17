@@ -5,11 +5,12 @@
   nodes remain connected. The pending marker collapses a post immediately
   before Faceberg invokes Facebook's native Hide control; a MutationObserver
   then converts it to the confirmed marker or restores it on failure. The
-  late-sponsored marker uses the same inner-root boundary without invoking
-  native Hide when slow hydration has already made the card visible.
+  suppressed-feed-unit marker uses the same inner-root boundary without ever
+  invoking native Hide, so Facebook keeps its post-to-handler ownership.
 */
+
 [data-faceberg-pending-native-hide],
-[data-faceberg-late-sponsored],
+[data-faceberg-suppressed-feed-unit],
 [data-faceberg-compact-hidden-feedback] {
   block-size: 1px !important;
   min-block-size: 0 !important;
@@ -30,8 +31,8 @@
 
 [data-faceberg-pending-native-hide],
 [data-faceberg-pending-native-hide] *,
-[data-faceberg-late-sponsored],
-[data-faceberg-late-sponsored] *,
+[data-faceberg-suppressed-feed-unit],
+[data-faceberg-suppressed-feed-unit] *,
 [data-faceberg-compact-hidden-feedback],
 [data-faceberg-compact-hidden-feedback] * {
   visibility: hidden !important;

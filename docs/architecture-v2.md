@@ -4,8 +4,8 @@
 
 The current development build leaves React-owned Home-feed units and MAIN-world
 browser methods untouched. It installs no global subtree observer. A lightweight
-scroll-driven pass detects nearby Sponsored cards and activates their single
-native `Hide post`/`Hide ad` control; Facebook performs the removal. A trusted
+scroll-driven pass detects nearby Sponsored, Follow, and Join cards and
+suppresses only their verified direct inner roots. A trusted
 comment/post click schedules three bounded checks for a real dialog or supported
 direct post/media route; once found, the existing surface-local comment watcher
 handles that context.
@@ -35,34 +35,45 @@ Faceberg is scoped to four stable behaviors:
   least two `/reel/` links, have the exact Reels heading, and resolve to a
   wrapper with one module action menu and no ordinary post footer.
 - Sponsored Reels in the full-screen viewer are handled independently from the
-  Home-feed Reels module. A match requires an exact `Sponsored` marker inside
-  the labelled video-player group, exactly one video in the full-screen item,
-  multiple videos in its parent Reel list, viewport-sized item geometry, and
-  at least one outbound ad link.
-- Faceberg removes the exact Sponsored Reel item from the scroll-snap layout
-  without disconnecting its React node. The same structural verification runs
-  again when Facebook remounts or rehydrates Reel items, so backward navigation
-  cannot restore a previously removed ad.
+  Home-feed Reels module. A match accepts a compact lower-player `Ad` badge, an
+  exact `Sponsored` marker, or a known ad CTA such as `Play game`. The item must
+  also contain Facebook's external redirect or a genuinely non-Facebook
+  destination; ordinary Facebook profile links are excluded. The labelled
+  video-player group, exactly one item video, multiple videos in its parent Reel
+  list, and viewport-sized item geometry remain mandatory.
+- A verified active ad advances through Facebook's native `Next Card` control;
+  it is never removed from layout while active. This preserves route, visible
+  Reel, and comment-sidebar ownership. A verified preloaded off-screen ad may
+  still be removed from the scroll-snap layout without disconnecting its React
+  node.
 - Sponsored-Reel detection uses one Reel-route-scoped observer and reacts only
   to relevant DOM/text/link/video hydration. It uses no polling or timer.
-- Main-feed Sponsored cards are hidden through the one visible native `Hide post`/`Hide ad` control inside the verified post boundary. Faceberg never removes, reparents, collapses, or makes the outer virtualized slot inert.
-- During initial Home hydration only, a verified Sponsored unit already inside
-  the viewport may enter the same native-hide transition before the first
-  trusted page input. The transition collapses the direct inner root before the
-  native click. After the first pointer, wheel, touch, or keyboard input, only
-  upcoming units with a full viewport buffer qualify.
-- Slow Chromium variants can reveal the Sponsored marker or native Hide control
-  only after an already-visible card has passed the initial-input gate. That
-  late-visible case never invokes Facebook's native Hide replacement. Faceberg
-  collapses only the verified direct inner root, keeps the outer
+- Main-feed Sponsored, Follow, and Join cards never invoke Facebook's native
+  `Hide post`/`Hide ad` transition. Live failures showed that even Facebook's
+  own replacement path can recycle a permalink handler onto a neighboring
+  virtualized card.
+- Faceberg collapses only the verified direct inner root, keeps the outer
   `[data-virtualized]`/`[aria-posinset]` unit connected, and uses a unit-scoped
-  observer to restore the root before paint if React recycles it for ordinary
-  content. A card that received recent trusted input remains fail-open.
+  observer plus post identity to restore the root before paint when React
+  recycles it for ordinary content.
 - The experimental compact-feedback setting may mark only the direct inner root of a confirmed `Ad hidden`/`Post hidden` payload. Confirmation requires one exact feedback heading, one exact `Undo` control, no post action menu or post footer, and one outer `[data-virtualized]`/`[aria-posinset]` boundary. A unit-scoped observer removes the mark before paint if React recycles the root for ordinary content.
 - Mutation and scroll events coalesce Sponsored detection into the next
-  rendering frame. A unit already undergoing Facebook's native hide transition
-  is not activated twice, and the activity counter changes only after Facebook
-  confirms the removal structurally.
+  rendering frame. An already-suppressed unit is not handled twice, and the
+  activity counter changes only after the verified inner root is marked.
+- Main-feed structural signals are scanned across every mounted card. Direct
+  suppression may act anywhere below one viewport plus a safety buffer after
+  resolving either an exact post-route identity or a long Facebook context
+  token; unlike native replacement, it has no two-viewport upper bound. A
+  generic post action label is never identity.
+- An identity-verified first-viewport Sponsored card is eligible only within
+  eight seconds of content-script startup and before any trusted pointer,
+  keyboard, wheel, or touch input. Visible suppression is otherwise forbidden.
+- The unit-scoped observer restores suppression immediately if the marker or
+  identity disappears or changes during React recycling. Ambiguous and
+  late-hydrated visible cards fail open.
+- Follow/Join suppression remains before-entry only. No main-feed path uses a
+  structural pre-paint selector, reserves visible height, inserts a placeholder,
+  invokes native Hide, or compensates the window scroll position.
 - The exact `CometHomeRightSideEgo.react` renderer and
   `useSideAdsRefreshHandler` hook are replaced at document start while feed
   filtering is enabled. This prevents the independently rendered sidebar ad
@@ -74,12 +85,12 @@ Faceberg is scoped to four stable behaviors:
 - Resolves sidebar and recommendation modules from the smallest ancestor that satisfies their full signal set.
 - Refuses every removal target that contains the main region, composer, or Feed posts heading.
 - Non-post modules cannot remove any target containing a post action menu; Sponsored and Follow/Join detection require one complete card and refuse multi-post targets.
-- Follow/Join post filtering uses the card's unique native `Hide post by …`
-  control and verifies that Facebook removed or replaced the CTA before counting
-  it. The optional compact-feedback contract may visually collapse the confirmed
-  inner replacement while leaving Facebook's outer virtualized unit connected.
+- Follow/Join post filtering requires the card's unique native `Hide post by …`
+  control as structural evidence, but does not activate it. The verified direct
+  inner root is suppressed under the same identity-gated, before-entry contract
+  as Sponsored feed cards.
 - Does not open posts, dialogs, or menus.
-- Native hiding cannot prevent a main-feed Sponsored card's initial shared
+- Visual suppression cannot prevent a main-feed Sponsored card's initial shared
   GraphQL payload or media request. The initial
   `CometRightSideHeaderCardsQuery` is also shared with useful non-ad right-rail
   cards, so Faceberg leaves that request intact while preventing the separate
@@ -111,6 +122,15 @@ Faceberg is scoped to four stable behaviors:
 - Reels are handled only through a separate active-reel resolver that must identify
   one visible reel comment surface without falling back into older dialogs or broad
   document scans.
+- Reel ownership is always resolved from the current document, never from the
+  mutation subtree or sidebar requesting a rerun. On `/reel/<id>`, the active
+  context must contain an exact matching Reel permalink; unresolved transitions
+  fail closed until the new context mounts. ID-less `/reels` browsing prefers
+  the visible large video nearest the viewport center.
+- If Facebook changes to a different Reel ID while leaving a mismatched comment
+  sidebar mounted, one bounded state machine presses the viewport-active Reel's
+  Comment control to close and reopen that sidebar. It never opens comments when
+  the previous Reel had no visible sidebar, and never repeats the recovery loop.
 - Resolves one active comment surface at a time and never shares execution between feed dialogs, direct posts, media surfaces, and reel surfaces.
 - Canonicalizes nested Facebook dialog shells to the deepest visible modal so one post cannot receive two competing controllers.
 - On already-open post dialogs, opens the Facebook comment-ordering popup for the active post only.

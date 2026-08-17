@@ -3,7 +3,7 @@
 
   const FEEDS_URL = "https://www.facebook.com/?filter=all&sk=h_chr&sorting_setting=CHRONOLOGICAL";
   const DEFAULT_SETTINGS = {
-    enableAntiRefresh: false,
+    enableAntiRefresh: true,
     enableFeedFilter: true,
     enableBlockSponsoredSidebar: true,
     enableGoDirectlyToFeeds: false,
@@ -148,9 +148,10 @@
   }
 
   async function readSettings() {
+    const settingKeys = Object.keys(DEFAULT_SETTINGS);
     const [syncResult, localResult] = await Promise.allSettled([
-      chrome.storage.sync.get(DEFAULT_SETTINGS),
-      chrome.storage.local.get(DEFAULT_SETTINGS)
+      chrome.storage.sync.get(settingKeys),
+      chrome.storage.local.get(settingKeys)
     ]);
 
     const syncSettings = syncResult.status === "fulfilled" ? syncResult.value : {};

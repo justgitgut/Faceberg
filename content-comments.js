@@ -124,7 +124,7 @@
     );
   }
 
-  function watchSurfaceMutations(surface, callback) {
+  function watchSurfaceMutations(surface, callback, onStop = null) {
     if (!(surface instanceof Element) || !document.contains(surface)) {
       return null;
     }
@@ -143,6 +143,11 @@
       if (rafId) {
         cancelAnimationFrame(rafId);
         rafId = 0;
+      }
+      try {
+        onStop?.();
+      } catch {
+        /* Watcher cleanup must never affect Facebook's UI lifecycle. */
       }
     }
 
@@ -186,10 +191,21 @@
       }
 
       for (const mutation of mutations) {
+        if (
+          mutation.type === "attributes" &&
+          mutation.target instanceof Element &&
+          (mutation.target.contains(surface) || surface.contains(mutation.target))
+        ) {
+          schedule();
+          return;
+        }
         for (const node of mutation.addedNodes) {
           if (
             node.nodeType === Node.ELEMENT_NODE &&
-            (node.querySelector('[role="menu"]') || node.matches('[role="menu"]'))
+            (
+              node.querySelector('[role="menu"], [role="dialog"]') ||
+              node.matches('[role="menu"], [role="dialog"]')
+            )
           ) {
             schedule();
             return;
@@ -197,7 +213,12 @@
         }
       }
     });
-    bodyObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
+    bodyObserver.observe(document.body || document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-hidden", "inert", "hidden", "style", "role", "aria-modal"]
+    });
 
     return { stop };
   }
@@ -231,6 +252,11 @@
         if (storyId) {
           return `post:${storyId}`;
         }
+      }
+
+      match = path.match(/\/reels?\/([^/?#]+)/i);
+      if (match) {
+        return `reel:${match[1]}`;
       }
     } catch {
       /* Fail closed when a candidate URL cannot be parsed. */
@@ -272,6 +298,36 @@
 
       return false;
     });
+  }
+
+  /*
+    Facebook commonly retains the previous dialog while a new permalink is
+    mounting. CSS visibility alone is insufficient: retained dialogs are often
+    aria-hidden, inert, or have no rendered geometry. Never let such a surface
+    retain an automation controller.
+  */
+  function isRenderedCommentSurface(surface) {
+    if (!(surface instanceof Element) || !surface.isConnected || !document.contains(surface)) {
+      return false;
+    }
+
+    if (surface.closest('[aria-hidden="true"], [inert], [hidden]')) {
+      return false;
+    }
+
+    if (!isVisible(surface)) {
+      return false;
+    }
+
+    const rect = surface.getBoundingClientRect?.();
+    return !!rect && rect.width > 0 && rect.height > 0;
+  }
+
+  function captureSurfaceRouteOwnership() {
+    return {
+      href: window.location.href,
+      identity: getPostRouteIdentity(window.location.href)
+    };
   }
 
   function getActiveEditableElement() {
@@ -322,6 +378,26 @@
     return /\/reel(?:s)?(?:\/|$)/i.test(path);
   }
 
+  function getCurrentReelRouteIdentity() {
+    const identity = getPostRouteIdentity(window.location.href);
+    return identity.startsWith("reel:") ? identity : "";
+  }
+
+  function hasExactCurrentReelRouteLink(surface) {
+    if (!(surface instanceof Element)) {
+      return false;
+    }
+
+    const currentIdentity = getCurrentReelRouteIdentity();
+    if (!currentIdentity) {
+      return true;
+    }
+
+    return [...surface.querySelectorAll('a[href*="/reel/"], a[href*="/reels/"]')].some(
+      (link) => getPostRouteIdentity(link.href) === currentIdentity
+    );
+  }
+
   function getViewportVisibilityScore(element) {
     if (!(element instanceof Element) || !isVisible(element)) {
       return 0;
@@ -364,7 +440,7 @@
       return false;
     }
 
-    return !!surface.querySelector('a[role="link"][href*="/reel/"], a[href*="/reel/"]');
+    return !!surface.querySelector('a[role="link"][href*="/reel/"], a[href*="/reel/"], a[href*="/reels/"]');
   }
 
   function hasReelsLabelSignals(surface) {
@@ -438,12 +514,11 @@
     return null;
   }
 
-  function getActiveReelContext(root = document) {
+  function getActiveReelContext(_root = document) {
     if (!isReelExperiencePage()) {
       return null;
     }
 
-    const scopeElement = root instanceof Element ? root : document.body;
     const selectors = 'div[role="article"], [data-pagelet], main, [role="main"]';
     const seen = new Set();
     const candidates = [];
@@ -453,18 +528,13 @@
         return;
       }
 
+      if (!hasExactCurrentReelRouteLink(surface)) {
+        return;
+      }
+
       seen.add(surface);
 
       let score = bias;
-      if (scopeElement instanceof Element && surface === scopeElement) {
-        score += 120;
-      }
-      if (scopeElement instanceof Element && surface.contains(scopeElement)) {
-        score += 60;
-      }
-      if (scopeElement instanceof Element && scopeElement.contains(surface)) {
-        score += 30;
-      }
       if (surface.matches('main, [role="main"]')) {
         score += 40;
       }
@@ -486,6 +556,7 @@
 
       const visibilityScore = getViewportVisibilityScore(surface);
       score += Math.min(140, visibilityScore);
+      score += getReelMediaCenterScore(surface);
 
       const rect = surface.getBoundingClientRect();
       candidates.push({
@@ -495,43 +566,65 @@
       });
     }
 
-    if (scopeElement instanceof Element) {
-      addCandidate(scopeElement.closest(selectors), 110);
-      if (scopeElement.matches(selectors)) {
-        addCandidate(scopeElement, 90);
-      }
-      scopeElement.querySelectorAll?.(selectors).forEach((surface) => addCandidate(surface, 20));
-    }
-
-    document.querySelectorAll('video, a[href*="/reel/"]').forEach((node) => {
+    document.querySelectorAll('a[href*="/reel/"], a[href*="/reels/"]').forEach((node) => {
       if (!(node instanceof Element) || !isVisible(node)) {
         return;
       }
 
-      addCandidate(node.closest(selectors), 35);
+      const currentIdentity = getCurrentReelRouteIdentity();
+      if (currentIdentity && getPostRouteIdentity(node.href) !== currentIdentity) {
+        return;
+      }
+
+      let candidate = node.closest(selectors);
+      while (candidate instanceof Element) {
+        if (isActiveReelContextCandidate(candidate)) {
+          addCandidate(candidate, 260);
+          break;
+        }
+        candidate = candidate.parentElement?.closest(selectors) || null;
+      }
+    });
+
+    document.querySelectorAll("video").forEach((video) => {
+      if (!(video instanceof Element) || !isVisible(video)) {
+        return;
+      }
+
+      const centerScore = getReelMediaCenterScore(video.parentElement);
+      if (centerScore > 0) {
+        addCandidate(video.closest(selectors), 80 + centerScore);
+      }
     });
 
     document.querySelectorAll(selectors).forEach((surface) => addCandidate(surface, 5));
     return chooseBestScopedCandidate(candidates);
   }
 
-  function getActiveReelCommentSurface(root = document) {
+  function getActiveReelCommentSurface(_root = document) {
     if (!isReelExperiencePage()) {
       return null;
     }
 
-    const reelContext = getActiveReelContext(root);
+    const reelContext = getActiveReelContext(document);
     if (!(reelContext instanceof Element)) {
       return null;
     }
 
-    const scopeElement = root instanceof Element ? root : reelContext;
+    const scopeElement = reelContext;
     const seen = new Set();
     const candidates = [];
     const selectors = '[role="complementary"], div[role="article"], [data-pagelet], main, [role="main"]';
 
     function addCandidate(surface, bias = 0) {
       if (!(surface instanceof Element) || seen.has(surface) || !isVisible(surface) || !hasCommentSurfaceSignals(surface)) {
+        return;
+      }
+
+      /* The broad Reel container can contain the new video permalink and the
+         previous sidebar at the same time. Require the comment surface itself
+         to expose the current Reel identity before it can own automation. */
+      if (!hasExactCurrentReelRouteLink(surface)) {
         return;
       }
 
@@ -592,7 +685,6 @@
       });
     }
 
-    addCandidate(reelContext, 80);
     reelContext.querySelectorAll(selectors).forEach((surface) => addCandidate(surface, 20));
 
     if (reelContext.parentElement instanceof Element) {
@@ -607,7 +699,7 @@
       return false;
     }
 
-    const activeSurface = getActiveReelCommentSurface(surface);
+    const activeSurface = getActiveReelCommentSurface(document);
     return activeSurface === surface;
   }
 
@@ -682,6 +774,41 @@
     });
   }
 
+  function getReelMediaCenterScore(surface) {
+    if (!(surface instanceof Element)) {
+      return 0;
+    }
+
+    const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+    const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+    const viewportCenterX = viewportWidth / 2;
+    const viewportCenterY = viewportHeight / 2;
+    const maxDistance = Math.max(1, Math.hypot(viewportCenterX, viewportCenterY));
+    let bestScore = 0;
+
+    surface.querySelectorAll("video").forEach((video) => {
+      if (!(video instanceof Element) || !isVisible(video)) {
+        return;
+      }
+
+      const rect = video.getBoundingClientRect();
+      if (!rect || rect.width < 220 || rect.height < 280) {
+        return;
+      }
+
+      const distance = Math.hypot(
+        rect.left + rect.width / 2 - viewportCenterX,
+        rect.top + rect.height / 2 - viewportCenterY
+      );
+      bestScore = Math.max(
+        bestScore,
+        Math.round(220 * Math.max(0, 1 - distance / maxDistance))
+      );
+    });
+
+    return bestScore;
+  }
+
   function hasPostDialogSignals(surface) {
     if (!(surface instanceof Element) || !surface.matches('[role="dialog"]')) {
       return false;
@@ -728,7 +855,7 @@
 
     const dialogs = [rootDialog, ...rootDialog.querySelectorAll('[role="dialog"]')]
       .filter((dialog, index, values) => {
-        return values.indexOf(dialog) === index && isVisible(dialog) && !isIgnoredDialog(dialog);
+        return values.indexOf(dialog) === index && isRenderedCommentSurface(dialog) && !isIgnoredDialog(dialog);
       });
     if (dialogs.length === 0) {
       return null;
@@ -740,36 +867,100 @@
     return modalDialog || dialogs[dialogs.length - 1];
   }
 
+  function getDocumentTopRenderedDialog() {
+    const visibleDialogs = [...document.querySelectorAll('[role="dialog"]')]
+      .filter((dialog) => isRenderedCommentSurface(dialog) && !isIgnoredDialog(dialog));
+    const modalDialogs = visibleDialogs.filter((dialog) => dialog.getAttribute("aria-modal") === "true");
+    return [...(modalDialogs.length > 0 ? modalDialogs : visibleDialogs)].reverse()[0] || null;
+  }
+
   function getTopVisibleDialog(root = document) {
     const scopedElement = root instanceof Element ? root : null;
     const scopedDialog = scopedElement ? scopedElement.closest('[role="dialog"]') : null;
     const canonicalScopedDialog = scopedDialog ? getCanonicalDialog(scopedDialog) : null;
+    const documentTopDialog = getDocumentTopRenderedDialog();
     if (
       canonicalScopedDialog &&
+      canonicalScopedDialog === documentTopDialog &&
       (!isMediaViewerSurface(canonicalScopedDialog) || hasCommentSurfaceSignals(canonicalScopedDialog))
     ) {
       return canonicalScopedDialog;
     }
 
-    const visibleDialogs = [...document.querySelectorAll('[role="dialog"]')]
-      .filter((dialog) => isVisible(dialog) && !isIgnoredDialog(dialog));
-    const modalDialogs = visibleDialogs.filter((dialog) => dialog.getAttribute("aria-modal") === "true");
-    const dialogs = [...(modalDialogs.length > 0 ? modalDialogs : visibleDialogs)].reverse();
-    return dialogs.find((dialog) => {
-      if (!isMediaViewerSurface(dialog)) {
-        return true;
+    return documentTopDialog;
+  }
+
+  function hasCurrentSurfaceOwnership(surface, ownership = null) {
+    if (!isRenderedCommentSurface(surface)) {
+      return false;
+    }
+
+    if (ownership && window.location.href !== ownership.href) {
+      return false;
+    }
+
+    const currentIdentity = getPostRouteIdentity(window.location.href);
+    if (ownership?.identity && currentIdentity !== ownership.identity) {
+      return false;
+    }
+
+    if (!surfaceMatchesCurrentPostRoute(surface)) {
+      return false;
+    }
+
+    const canonicalDialog = surface.matches('[role="dialog"]')
+      ? getCanonicalDialog(surface)
+      : surface.closest('[role="dialog"]');
+    if (canonicalDialog) {
+      return canonicalDialog === getDocumentTopRenderedDialog();
+    }
+
+    if (isReelCommentSurface(surface)) {
+      return getActiveReelCommentSurface(document) === surface;
+    }
+
+    return isDirectPostPage() || isMediaViewerPage();
+  }
+
+  function ensureCurrentSurfaceWatcher(target, deps = {}) {
+    if (!(target instanceof Element)) {
+      return;
+    }
+
+    const existing = activeExpansionWatchers.get(target);
+    if (existing?.ownership && hasCurrentSurfaceOwnership(target, existing.ownership)) {
+      return;
+    }
+    existing?.stop?.();
+    activeExpansionWatchers.delete(target);
+
+    const ownership = captureSurfaceRouteOwnership();
+    if (!hasCurrentSurfaceOwnership(target, ownership)) {
+      return;
+    }
+
+    let watcher = null;
+    const stop = () => {
+      watcher?.stop?.();
+      activeExpansionWatchers.delete(target);
+    };
+    watcher = watchSurfaceMutations(target, () => {
+      if (!hasCurrentSurfaceOwnership(target, ownership)) {
+        stop();
+        return;
       }
-      /* Allow media viewer dialogs that also contain comment UI
-         (e.g. photo lightbox with an inline comment section). */
-      return hasCommentSurfaceSignals(dialog);
-    }) || null;
+      runCommentAutomation(target, deps);
+    }, () => {
+      activeExpansionWatchers.delete(target);
+    });
+
+    if (watcher) {
+      activeExpansionWatchers.set(target, { stop, ownership });
+    }
   }
 
   function getBlockingMediaViewerOverlay() {
-    const visibleDialogs = [...document.querySelectorAll('[role="dialog"]')]
-      .filter((dialog) => isVisible(dialog) && !isIgnoredDialog(dialog));
-    const modalDialogs = visibleDialogs.filter((dialog) => dialog.getAttribute("aria-modal") === "true");
-    const topVisibleDialog = [...(modalDialogs.length > 0 ? modalDialogs : visibleDialogs)].reverse()[0] || null;
+    const topVisibleDialog = getDocumentTopRenderedDialog();
 
     if (topVisibleDialog && isMediaViewerSurface(topVisibleDialog) && !hasCommentSurfaceSignals(topVisibleDialog)) {
       return topVisibleDialog;
@@ -789,28 +980,7 @@
     ) {
       return visibleDialog;
     }
-
-    if (!(root instanceof Element)) {
-      return null;
-    }
-
-    /* If the topmost visible overlay is a media viewer without comment UI yet,
-       do not fall back to older dialogs underneath it or a previously viewed post
-       dialog can be re-targeted when the user simply opens a photo. */
-    if (getBlockingMediaViewerOverlay()) {
-      return null;
-    }
-
-    const dialogs = [...document.querySelectorAll('[role="dialog"]')]
-      .map((dialog) => getCanonicalDialog(dialog))
-      .filter((dialog, index, values) => {
-        return dialog &&
-          values.indexOf(dialog) === index &&
-          surfaceMatchesCurrentPostRoute(dialog) &&
-          hasAutomatableDialogSignals(dialog);
-      })
-      .reverse();
-    return dialogs[0] || null;
+    return null;
   }
 
   function isCommentHintControl(control) {
@@ -1566,7 +1736,7 @@
   }
 
   function selectAllCommentsFromResolvedMenu(surface, openMenu, state, toggleText, deps = {}, { respectCooldown = true } = {}) {
-    if (isCommentAutomationSuspended(deps)) {
+    if (isCommentAutomationSuspended(deps) || !hasCurrentSurfaceOwnership(surface)) {
       clearCommentFilterRetry(state);
       clearMenuWatcher(state);
       restoreFilterScroll(state);
@@ -1692,11 +1862,13 @@
     }
 
     const state = getCommentFilterState(surface);
+    const ownership = captureSurfaceRouteOwnership();
 
     const runRetry = () => {
       if (
         isCommentAutomationSuspended(deps) ||
-        getRuntimeSettings(deps)?.enableCommentSortAll === false
+        getRuntimeSettings(deps)?.enableCommentSortAll === false ||
+        !hasCurrentSurfaceOwnership(surface, ownership)
       ) {
         state.pendingSelectionStat = false;
         state.selectionAttempts = 0;
@@ -1705,7 +1877,7 @@
         return;
       }
 
-      if (!surface.isConnected || !isVisible(surface)) {
+      if (!isRenderedCommentSurface(surface)) {
         state.pendingSelectionStat = false;
         state.selectionAttempts = 0;
         clearCommentFilterRetry(state);
@@ -1738,10 +1910,9 @@
             state.menuWatcher = watchForMenuReady(menuElement, (resolvedMenuElement) => {
               state.menuWatcher = null;
 
-              if (isCommentAutomationSuspended(deps) ||
-                  getRuntimeSettings(deps)?.enableCommentSortAll === false ||
-                  !surface.isConnected ||
-                  !isVisible(surface)) {
+                if (isCommentAutomationSuspended(deps) ||
+                    getRuntimeSettings(deps)?.enableCommentSortAll === false ||
+                    !hasCurrentSurfaceOwnership(surface, ownership)) {
                 clearCommentFilterRetry(state);
                 restoreFilterScroll(state);
                 return;
@@ -2027,7 +2198,7 @@
       return forcedDialog;
     }
 
-    const reelSurface = getActiveReelCommentSurface(scopeElement || document);
+    const reelSurface = getActiveReelCommentSurface(document);
     if (reelSurface) {
       return reelSurface;
     }
@@ -2631,6 +2802,14 @@
       return false;
     }
 
+    if (!hasCurrentSurfaceOwnership(target)) {
+      debugCommentAutomation("run-automation-skip", {
+        reason: "stale-or-noncurrent-surface",
+        target: describeElement(target)
+      });
+      return false;
+    }
+
     debugCommentAutomation("run-automation", {
       target: describeElement(target),
       directPost: isDirectPostPage() || isMediaViewerPage(),
@@ -2700,19 +2879,10 @@
     runCommentAutomation(root, deps);
 
     const target = getActiveCommentAutomationRoot(root);
-    if (!target || activeExpansionWatchers.has(target)) {
+    if (!target) {
       return;
     }
-
-    const watcher = watchSurfaceMutations(target, () => {
-      if (target.isConnected && isVisible(target)) {
-        runCommentAutomation(target, deps);
-      }
-    });
-
-    if (watcher) {
-      activeExpansionWatchers.set(target, watcher);
-    }
+    ensureCurrentSurfaceWatcher(target, deps);
   }
 
   function clickCommentExpanders(root = document, deps = {}) {
@@ -2754,6 +2924,7 @@
 
     const expansionState = getCommentExpansionState(activeDialog);
     const routeHref = window.location.href;
+    const surfaceOwnership = captureSurfaceRouteOwnership();
     if (expansionState.routeHref !== routeHref) {
       expansionState.totalAttempts = 0;
       expansionState.routeHref = routeHref;
@@ -3139,8 +3310,7 @@
       }
       if (
         window.location.href !== routeHref ||
-        !activeDialog.isConnected ||
-        !isVisible(activeDialog) ||
+        !hasCurrentSurfaceOwnership(activeDialog, surfaceOwnership) ||
         !(retryableDirectOpener
           ? activateCommentControl(control)
           : activateCommentExpanderControl(control, controlKind))
@@ -3172,17 +3342,7 @@
       return "none";
     }
 
-    if (!activeExpansionWatchers.has(activeDialog)) {
-      const watcher = watchSurfaceMutations(activeDialog, () => {
-        if (activeDialog.isConnected && isVisible(activeDialog)) {
-          runCommentAutomation(activeDialog, deps);
-        }
-      });
-
-      if (watcher) {
-        activeExpansionWatchers.set(activeDialog, watcher);
-      }
-    }
+    ensureCurrentSurfaceWatcher(activeDialog, deps);
 
     return "expanded";
   }

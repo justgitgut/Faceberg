@@ -6,12 +6,16 @@ Use this checklist after changing feed cleanup, post expansion, comment expansio
 
 1. Open the main Facebook feed.
 2. Verify destructive filtering remains fail-open for ordinary React-owned
-   post cards and People You May Know. Follow/Join posts and Sponsored posts
-   should be removed only through Facebook's native hide controls. Exact
+   post cards. Follow/Join, Sponsored, and People You May Know targets should
+   use connected, reversible layout suppression. Exact
    standalone Reels and Stories roots may be layout-hidden while their nodes
    remain connected. The independent right-column Sponsored module may still
    be removed directly.
-3. Confirm each detected main-feed Sponsored card is hidden through Facebook's native `Hide post`/`Hide ad` control, with no Faceberg placeholder or direct removal/reparenting of Facebook's resulting `Ad hidden` / `Undo` feedback payload. With compact feedback enabled, the direct inner root must collapse before the native click while the outer virtualized unit remains untouched.
+3. On a fresh load, confirm a main-feed card containing the exact ad-only
+   `meta` + `title` + `cta` + outbound-link bundle is `display: none` at its
+   direct root before it paints. It must never produce a placeholder or invoke
+   Facebook's native `Hide post`/`Hide ad` control. The JavaScript fallback may
+   compact only a verified card safely below the viewport.
 4. Scroll the feed and confirm newly inserted or text/ARIA-hydrated Sponsored
    cards are handled on the next rendering frame, with no delayed follow-up
    scan.
@@ -26,38 +30,43 @@ Use this checklist after changing feed cleanup, post expansion, comment expansio
    module returns immediately, its marker is removed, and the other module
    remains governed by its own setting.
 10. Open the full-screen Reels viewer with **Remove Sponsored Reels** enabled.
-    Confirm the exact Sponsored Reel occupies no scroll-snap layout space, its
-    DOM node remains connected, and the neighboring Reel video and Next,
-    Previous, Comment, and close controls remain responsive.
+    Confirm ads using the compact lower-player `Ad` badge and a `Play game` CTA
+    are detected with an explicit external destination. The active ad must
+    advance through the native `Next Card` control; the resulting URL, visible
+    Reel, and comment sidebar must all belong to the same next item.
 11. Confirm a Sponsored Reel increments `removedSponsoredReels` exactly once.
-    Navigate backward across the removed item and confirm it does not reappear
-    after Facebook remounts or rehydrates the Reel stack. Disable only
+    Confirm a verified preloaded off-screen ad occupies no scroll-snap space and
+    stays suppressed after Facebook remounts or rehydrates the Reel stack.
+    Disable only
     **Remove Sponsored Reels** and verify Sponsored Reels remain
     native while the Home-feed **Hide Reels** setting keeps its independent
     behavior.
-12. Confirm ordinary captions containing the word “sponsored”, Reel comments,
-    non-Reel videos, and ambiguous multi-video roots never qualify. A valid
-    target must have the exact video-player marker, one item video, sibling
-    Reel videos, viewport-sized geometry, and an outbound ad destination.
-13. Confirm a Sponsored label that finishes hydrating after its wrapper is inserted invokes the native hide control without Faceberg directly mutating the React-owned feed item.
+12. Confirm ordinary captions containing “sponsored” or “ad”, Facebook profile
+    links, organic caption links, non-Reel videos, and ambiguous multi-video
+    roots never qualify. The compact `Ad` badge must be a leaf label in the
+    lower half of the video player. A CTA signal must be an exact known action
+    on an external anchor; every valid target must also have the exact player
+    marker, one item video, sibling Reel videos, and viewport-sized geometry.
+13. Confirm a Sponsored label that finishes hydrating after its wrapper is inserted suppresses only the direct inner root and never invokes the native Hide control.
 14. Confirm ordinary obfuscated author, timestamp, media, and outbound links never qualify as Sponsored markers.
 15. Confirm Faceberg never marks, collapses, restyles, makes inert, removes, or reparents the outer React-owned Sponsored feed unit.
 16. Confirm Follow and Join controls are detected both with and without a `tabindex` attribute.
-17. Confirm a complete Follow/Join CTA post is hidden through its single native `Hide post by …` control while Facebook's resulting `Post hidden` or plain `Hidden` author-options panel is compacted and all standalone navigation, dialog, toolbar, and menu buttons remain untouched.
+17. Confirm a complete Follow/Join CTA post uses its single native `Hide post by …` control only as verification evidence, suppresses its direct inner root without clicking that control, and leaves standalone navigation, dialog, toolbar, and menu buttons untouched.
 18. Disable each Follow/Join toggle independently and confirm only the enabled CTA type is hidden.
 19. Confirm a physically removed filtered module is removed again, without another stat increment, if React reconnects the same node.
 20. Type continuously in a Facebook search, comment, or message composer and confirm Faceberg does not schedule full-feed cleanup from those mutations.
 21. After opening and closing several post dialogs, confirm disconnected
    surface observers stop and the number of live observers does not accumulate.
-22. Scroll normally and confirm newly hydrated Sponsored cards are handled
-   card-locally in the feed observer turn without moving the viewport or
-   waiting for an animation frame, idle callback, or timer.
+22. Scroll normally in both directions. Confirm upcoming verified cards compact
+   before entry. Newly identified cards at or above the viewport must remain
+   native; upward scrolling must never rebound and the feed must contain no
+   Faceberg-created full-card gaps.
 23. With a Sponsored or Follow/Join item between two ordinary posts, click the visible comment control above and below it; each click must open the comments for that same visible post.
 24. Open one post, close it, and immediately open a different post; confirm the second dialog and permalink belong to the second card even when Sponsored/Follow/Join cards are nearby.
-25. Confirm native Sponsored/Follow/Join filtering never runs behind an open
-   modal or because of a post-navigation click, and resumes only after an
-   observed route/dialog/inline-comment change.
-26. Scroll past several natively hidden items and confirm Facebook continues loading ordinary feed items without a persistent loader or automatic scroll loop.
+25. Confirm Sponsored/Follow/Join suppression never runs behind an open modal
+   or because of a post-navigation click, and resumes only after an observed
+   route/dialog/inline-comment change.
+26. Scroll past several suppressed items and confirm Facebook continues loading ordinary feed items without a persistent loader or automatic scroll loop.
 27. Play and pause videos in several ordinary feed cards; native controls must respond immediately and no invisible or inert Faceberg wrapper may cover them.
 28. Confirm that no `[data-faceberg-sponsored-mask-host]` placeholder remains after upgrading from the abandoned masking implementation.
 25. Open and close a post; confirm scoped feed observers reconnect from the
@@ -72,22 +81,25 @@ Use this checklist after changing feed cleanup, post expansion, comment expansio
     confirm those module targets are absent while main-feed Sponsored filtering
     remains enabled. Reverse the two Sponsored settings and confirm the sidebar
     stays blocked while main-feed Sponsored posts remain native.
-27. With `Compact hidden feedback (experimental)` enabled, confirm the detected post becomes a one-pixel gap before Facebook's native hide click paints a spinner; the event-driven transition must keep exact `Ad hidden`, `Post hidden`, or verified plain `Hidden` feedback collapsed without polling timeouts.
+27. With `Compact hidden feedback (experimental)` enabled, manually hide a
+   post and confirm an exact `Ad hidden`, `Post hidden`, or verified plain
+   `Hidden` feedback payload can be compacted without polling timeouts.
 28. Scroll until Facebook recycles the compacted unit; confirm the next ordinary post is visible, opens its own comments, plays video normally, and does not retain `data-faceberg-compact-hidden-feedback`.
 29. Disable compact feedback and apply settings; confirm any currently connected compacted feedback payload is restored and no ordinary feed card changes.
-30. On a fresh Home load, confirm a verified Sponsored card already inside the
-   first viewport collapses and enters Facebook's native hide transition before
-   the first trusted input. After any pointer, wheel, touch, or keyboard input,
-   confirm visible cards are left alone and only an upcoming card at least one
-   viewport below may be replaced.
+30. On a fresh Home load, confirm a verified Sponsored card is suppressed after
+   it exposes an exact permalink or a long Facebook context identity. Cards
+   below the viewport buffer must qualify even beyond two viewports. A stable
+   first-viewport ad may qualify only within eight seconds and before any input.
+   Confirm there is no structural card-hiding CSS, visible placeholder, scroll
+   compensation, or native Hide click.
 31. Click a timestamp, post body, media, comment control, and other query-only
    link on a visible card while feed mutations are arriving; each must open its
    own post, never a recently hidden adjacent card or an unavailable route.
-32. In Vivaldi or another slow Chromium variant, let a verified Sponsored label
-   hydrate only after its card is visible and the page has received trusted
-   input. Confirm Faceberg collapses only that card's direct inner root, leaves
-   the outer virtualized unit connected, performs no native Hide click, and
-   restores the root if Facebook recycles the unit for an ordinary post.
+32. In Vivaldi or another slow Chromium variant, let Facebook recycle a
+   suppressed Sponsored unit into an ordinary card. During the identity-less
+   hydration window, confirm suppression is removed immediately; the generic
+   `Actions for this post` label must not inherit the previous identity. Click
+   the ordinary card repeatedly and confirm its own post opens every time.
 33. Interact with a still-hydrating Sponsored card itself. Confirm the recent
    trusted-card guard leaves that unit untouched during the interaction.
 
@@ -130,18 +142,21 @@ Use this checklist after changing feed cleanup, post expansion, comment expansio
 22. Confirm `All comments` becomes the selected option when the reel sorter is present.
 23. Confirm `Filter changes` increments only when the reel sorter actually switches.
 24. Verify visible reel comment/reply expansion works after sorting changes.
-24. Confirm no older feed/dialog post reopens while using the reel surface.
-25. If multiple reel candidates are visible, confirm automation prefers doing nothing over opening the wrong surface.
-26. Open a direct post whose active modal uses query-only timestamp/story links while its comment permalinks carry a different post ID; confirm the visible modal still switches to `All comments` and the mounted Home feed is not treated as the target.
-27. Close a post with the modal-local close button and confirm no other post
+25. Advance through at least five Reels without closing the viewer. After each
+    route change, confirm the sidebar belongs to the current Reel and that the
+    first Reel's sorter, comments, and reply controls are never reused.
+26. Confirm no older feed/dialog post reopens while using the reel surface.
+27. If multiple reel candidates are visible, confirm automation prefers doing nothing over opening the wrong surface.
+28. Open a direct post whose active modal uses query-only timestamp/story links while its comment permalinks carry a different post ID; confirm the visible modal still switches to `All comments` and the mounted Home feed is not treated as the target.
+29. Close a post with the modal-local close button and confirm no other post
    opens during teardown.
-28. Repeat with Facebook's top-left page-header close button and confirm the
+30. Repeat with Facebook's top-left page-header close button and confirm the
    same clean return to Home.
-29. In Vivaldi, open a sorter whose loading popup node is replaced before its
+31. In Vivaldi, open a sorter whose loading popup node is replaced before its
    rows appear. Confirm Faceberg re-resolves the replacement, selects
    `All comments`, and processes the menu mutation without waiting for an
    animation frame.
-30. Stall rendering for longer than the normal selection window and confirm the
+32. Stall rendering for longer than the normal selection window and confirm the
    same sorter row is activated no more than twice; elapsed time must not reset
    the attempt count or make the popup blink indefinitely.
 

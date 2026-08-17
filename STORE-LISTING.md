@@ -26,16 +26,25 @@ Main features:
 
 - Blocks Facebook-initiated automatic feed refreshes while leaving manual
   browser reloads available.
-- Hides Sponsored posts in the main feed and the right-column Sponsored module.
-- Removes Sponsored Reels and hides the Reels and Stories blocks.
+- Hides verified Sponsored posts after binding each card to a stable post
+  identity. Faceberg scans all mounted cards below a viewport safety buffer and
+  handles stable first-screen ads only during bounded startup before input,
+  then restores a card immediately if Facebook recycles its feed unit. There
+  are no blank placeholders or scroll compensation. Faceberg also hides the
+  independent right-column module.
+- Removes Sponsored Reels using compact ad badges or known ad CTAs plus a
+  verified external destination, while keeping native Reel navigation
+  synchronized; also hides the Reels and Stories blocks.
 - Hides People You May Know, Follow, and Join suggestions.
 - Expands truncated posts, comment text, and nested replies.
-- Switches supported discussions to All comments.
+- Switches supported discussions to All comments, with Reel automation bound to
+  the currently viewed Reel rather than a recycled previous sidebar.
 - Applies your preferred sorting option on supported root group feeds.
 - Lets you enable or disable each cleanup and expansion behavior independently.
 
-The popup also shows local activity counters and includes a Copy Debug
-Information action for troubleshooting.
+The popup also shows local activity counters, includes a Copy Debug Information
+action for troubleshooting, and presents current release notes in its About
+tab.
 
 Faceberg stores settings and activity counters locally in the browser. It does
 not transmit Facebook content to external servers.
@@ -63,7 +72,7 @@ comments, and replies.
 
 ## Support URL
 
-https://github.com/justgitgut/Faceberg/issues
+https://github.com/justgitgut/Faceberg/issues/
 
 ## Privacy Policy URL
 

@@ -14,6 +14,7 @@
     normalizeText,
     hasPostActionControl,
     isVisible,
+    pressElement,
     getRuntimeSettings,
     queueRuntimeStatIncrement
   } = contentUtils;
@@ -29,12 +30,34 @@
   const countedSponsoredReelRoutes = new Set();
   const compactedHiddenFeedbackMonitors = new WeakMap();
   const pendingNativeHideTransitions = new WeakMap();
-  const lateVisibleSponsoredSuppressions = new Map();
+  const suppressedFeedUnits = new Map();
   const COMPACT_HIDDEN_FEEDBACK_ATTRIBUTE = "data-faceberg-compact-hidden-feedback";
   const PENDING_NATIVE_HIDE_ATTRIBUTE = "data-faceberg-pending-native-hide";
-  const LATE_SPONSORED_ATTRIBUTE = "data-faceberg-late-sponsored";
+  const SUPPRESSED_FEED_UNIT_ATTRIBUTE = "data-faceberg-suppressed-feed-unit";
   const HIDDEN_FEED_MODULE_ATTRIBUTE = "data-faceberg-hidden-feed-module";
   const HIDDEN_SPONSORED_REEL_ATTRIBUTE = "data-faceberg-hidden-sponsored-reel";
+  const SPONSORED_REEL_CTA_LABELS = new Set([
+    "apply now",
+    "book now",
+    "contact us",
+    "download",
+    "get offer",
+    "get quote",
+    "get started",
+    "install now",
+    "learn more",
+    "open link",
+    "order now",
+    "play game",
+    "play now",
+    "send message",
+    "shop now",
+    "sign up",
+    "subscribe",
+    "use app",
+    "watch more"
+  ]);
+  const sponsoredReelSkipAttempts = new Map();
   const SPONSORED_LABEL_NOISE_PATTERN =
     /[\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFEFF]/gu;
   const HIDDEN_FEEDBACK_LABELS = new Set([
@@ -54,6 +77,10 @@
     standalone Stories/Reels modules are only layout-hidden and stay connected.
   */
   const ENABLE_REACT_FEED_MUTATIONS = false;
+  /* Facebook's own Hide post/Hide ad transition can recycle a virtualized
+     card's click handlers onto a neighbouring post. Keep the code path
+     available for diagnosis, but never invoke it from production cleanup. */
+  const ENABLE_NATIVE_FEED_HIDE_ACTIONS = false;
 
   function getEnabledPostLabels(settings) {
     const labels = [];
@@ -471,55 +498,102 @@
       : null;
   }
 
-  function restoreLateVisibleSponsoredSuppression(
+  function isFeedSuppressionEnabled(suppression, settings) {
+    if (!settings?.enableFeedFilter || !suppression) {
+      return false;
+    }
+
+    if (suppression.statKey === "removedSponsored") {
+      return settings.enableBlockSponsoredPosts !== false;
+    }
+    if (suppression.statKey === "removedFollowPosts") {
+      return settings.enableBlockFollowPosts !== false;
+    }
+    if (suppression.statKey === "removedJoinPosts") {
+      return settings.enableBlockJoinPosts !== false;
+    }
+    return false;
+  }
+
+  function restoreSuppressedFeedUnit(
     unit,
     reason = "restored"
   ) {
-    const suppression = lateVisibleSponsoredSuppressions.get(unit);
+    const suppression = suppressedFeedUnits.get(unit);
     if (!suppression) {
       return;
     }
 
     suppression.observer?.disconnect();
     for (const contentRoot of suppression.contentRoots) {
-      contentRoot.removeAttribute(LATE_SPONSORED_ATTRIBUTE);
+      contentRoot.removeAttribute(SUPPRESSED_FEED_UNIT_ATTRIBUTE);
     }
-    lateVisibleSponsoredSuppressions.delete(unit);
-    debugFeedCleanup("feed-sponsored-late-restored", { reason });
+    suppressedFeedUnits.delete(unit);
+    debugFeedCleanup("feed-unit-suppression-restored", {
+      reason,
+      statKey: suppression.statKey
+    });
   }
 
-  function restoreAllLateVisibleSponsoredSuppressions(reason = "disabled") {
-    for (const unit of [...lateVisibleSponsoredSuppressions.keys()]) {
-      restoreLateVisibleSponsoredSuppression(unit, reason);
+  function restoreAllSuppressedFeedUnits(reason = "disabled") {
+    for (const unit of [...suppressedFeedUnits.keys()]) {
+      restoreSuppressedFeedUnit(unit, reason);
     }
   }
 
-  function reconcileLateVisibleSponsoredSuppressions(deps = {}) {
+  function reconcileSuppressedFeedUnits(deps = {}) {
     const settings = getRuntimeSettings(deps);
-    for (const unit of [...lateVisibleSponsoredSuppressions.keys()]) {
-      const suppression = lateVisibleSponsoredSuppressions.get(unit);
+    for (const unit of [...suppressedFeedUnits.keys()]) {
+      const suppression = suppressedFeedUnits.get(unit);
       if (!unit.isConnected) {
-        restoreLateVisibleSponsoredSuppression(unit, "disconnected");
-      } else if (
-        !settings?.enableFeedFilter ||
-        settings.enableBlockSponsoredPosts === false
-      ) {
-        restoreLateVisibleSponsoredSuppression(unit, "setting-disabled");
-      } else if (!hasSponsoredMarkerWithin(unit)) {
+        restoreSuppressedFeedUnit(unit, "disconnected");
+      } else if (!isFeedSuppressionEnabled(suppression, settings)) {
+        restoreSuppressedFeedUnit(unit, "setting-disabled");
+      } else if (!suppression.hasMarker(unit)) {
         const currentTarget = getCompletePostTargetWithin(
           unit,
           suppression?.target
         );
         const currentIdentity = getFeedPostIdentity(currentTarget);
-        if (
-          currentIdentity &&
+        if (!currentIdentity) {
+          restoreSuppressedFeedUnit(unit, "identity-unavailable");
+        } else if (
           suppression?.postIdentity &&
           currentIdentity !== suppression.postIdentity
         ) {
-          restoreLateVisibleSponsoredSuppression(unit, "react-recycled");
+          restoreSuppressedFeedUnit(unit, "react-recycled");
         }
       }
     }
+  }
+
+  function getFeedPostRouteIdentity(href) {
+    try {
+      const url = new URL(String(href || ""), window.location.href);
+      const path = url.pathname;
+      let match = path.match(
+        /\/groups\/([^/?#]+)\/(?:posts|permalink)\/([^/?#]+)/i
+      );
+      if (match) {
+        return `group:${match[1]}:post:${match[2]}`;
+      }
+
+      match = path.match(/\/([^/?#]+)\/(?:posts|permalink)\/([^/?#]+)/i);
+      if (match) {
+        return `profile:${match[1]}:post:${match[2]}`;
+      }
+
+      const storyId =
+        url.searchParams.get("story_fbid") ||
+        url.searchParams.get("story_id");
+      if (storyId) {
+        return `story:${storyId}`;
+      }
+    } catch (_error) {
+      /* An ambiguous link is not safe suppression identity. */
+    }
+
+    return "";
   }
 
   function getFeedPostIdentity(target) {
@@ -527,11 +601,18 @@
       return "";
     }
 
-    const actionLabel = normalizeText(
-      target.querySelector(
-        '[role="button"][aria-label^="Actions for this post" i]'
-      )?.getAttribute("aria-label") || ""
-    );
+    const routeIdentity = [
+      ...target.querySelectorAll(
+        '[data-ad-rendering-role="meta"] a[href], a[href*="/posts/"], a[href*="/permalink/"], a[href*="story_fbid="]'
+      )
+    ]
+      .slice(0, 24)
+      .map((link) => getFeedPostRouteIdentity(link.getAttribute("href")))
+      .find(Boolean) || "";
+    if (routeIdentity) {
+      return `route:${routeIdentity}`;
+    }
+
     const cftToken = [
       ...target.querySelectorAll('a[href*="__cft__"], [role="link"][href*="__cft__"]')
     ]
@@ -540,11 +621,9 @@
         const href = String(link.getAttribute("href") || "");
         return href.match(/[?&]__cft__\[0\]=([^&#]+)/)?.[1] || "";
       })
-      .find(Boolean) || "";
+      .find((token) => token.length >= 32) || "";
 
-    return actionLabel || cftToken
-      ? `${actionLabel}|${cftToken}`
-      : "";
+    return cftToken ? `cft:${cftToken}` : "";
   }
 
   function getCompletePostTargetWithin(unit, preferredTarget = null) {
@@ -611,15 +690,30 @@
     return null;
   }
 
-  function suppressLateVisibleSponsored(unit, target, deps = {}) {
+  function suppressFeedUnitWithoutNativeHide(
+    unit,
+    target,
+    { blockedLabel = "", statKey = "" } = {},
+    deps = {}
+  ) {
     const postIdentity = getFeedPostIdentity(target);
+    const isSponsored = statKey === "removedSponsored";
+    const hasMarker = isSponsored
+      ? (candidateUnit) => hasSponsoredMarkerWithin(candidateUnit)
+      : (candidateUnit) => hasBlockedPostLabelWithin(candidateUnit, blockedLabel);
     if (
       !(unit instanceof Element) ||
       !(target instanceof Element) ||
       !postIdentity ||
+      ![
+        "removedSponsored",
+        "removedFollowPosts",
+        "removedJoinPosts"
+      ].includes(statKey) ||
+      (!isSponsored && !["follow", "join"].includes(blockedLabel)) ||
       pendingNativeHideTransitions.has(unit) ||
-      lateVisibleSponsoredSuppressions.has(unit) ||
-      !getNativePostHideControl(target, { includeHideAd: true })
+      suppressedFeedUnits.has(unit) ||
+      !getNativePostHideControl(target, { includeHideAd: isSponsored })
     ) {
       return false;
     }
@@ -639,15 +733,21 @@
       contentRoots: new Set(),
       observer: null,
       postIdentity,
+      blockedLabel,
+      hasMarker,
+      statKey,
       target,
       unit
     };
 
     const markCurrentRoot = ({ allowIdentityFallback = false } = {}) => {
-      let currentTarget = getSponsoredTargetWithin(
-        unit,
-        suppression.target
-      );
+      let currentTarget = isSponsored
+        ? getSponsoredTargetWithin(unit, suppression.target)
+        : (
+          hasMarker(unit)
+            ? getCompletePostTargetWithin(unit, suppression.target)
+            : null
+        );
       if (
         !(currentTarget instanceof Element) &&
         allowIdentityFallback
@@ -666,6 +766,14 @@
         return false;
       }
 
+      const currentIdentity = getFeedPostIdentity(currentTarget);
+      if (
+        !currentIdentity ||
+        currentIdentity !== suppression.postIdentity
+      ) {
+        return false;
+      }
+
       const currentRoot = getDirectFeedUnitContentRoot(unit, currentTarget);
       if (
         !(currentRoot instanceof Element) ||
@@ -680,12 +788,12 @@
       suppression.target = currentTarget;
       for (const previousRoot of [...suppression.contentRoots]) {
         if (previousRoot !== currentRoot) {
-          previousRoot.removeAttribute(LATE_SPONSORED_ATTRIBUTE);
+          previousRoot.removeAttribute(SUPPRESSED_FEED_UNIT_ATTRIBUTE);
           suppression.contentRoots.delete(previousRoot);
         }
       }
       suppression.contentRoots.add(currentRoot);
-      currentRoot.setAttribute(LATE_SPONSORED_ATTRIBUTE, "removedSponsored");
+      currentRoot.setAttribute(SUPPRESSED_FEED_UNIT_ATTRIBUTE, statKey);
       return true;
     };
 
@@ -693,45 +801,45 @@
       const settings = getRuntimeSettings(deps);
       if (
         !unit.isConnected ||
-        !settings?.enableFeedFilter ||
-        settings.enableBlockSponsoredPosts === false
+        !isFeedSuppressionEnabled(suppression, settings)
       ) {
-        restoreLateVisibleSponsoredSuppression(
+        restoreSuppressedFeedUnit(
           unit,
           unit.isConnected ? "setting-disabled" : "disconnected"
         );
         return;
       }
 
-      if (!hasSponsoredMarkerWithin(unit)) {
+      if (!hasMarker(unit)) {
         /*
-          Facebook temporarily removes the accessible Sponsored label while
-          rehydrating the same post. Keep that exact post suppressed and restore
-          only after the virtualized unit exposes a different verified identity.
+          Facebook can temporarily remove the qualifying label while
+          rehydrating the same post. Keep that exact identity suppressed and
+          restore only after the virtualized unit exposes a different post.
         */
         const currentTarget = getCompletePostTargetWithin(
           unit,
           suppression.target
         );
         const currentIdentity = getFeedPostIdentity(currentTarget);
-        if (
-          currentIdentity &&
-          currentIdentity !== suppression.postIdentity
-        ) {
-          restoreLateVisibleSponsoredSuppression(unit, "react-recycled");
+        if (!currentIdentity) {
+          restoreSuppressedFeedUnit(unit, "identity-unavailable");
+          return;
+        }
+        if (currentIdentity !== suppression.postIdentity) {
+          restoreSuppressedFeedUnit(unit, "react-recycled");
           return;
         }
         if (
           currentIdentity === suppression.postIdentity &&
           !markCurrentRoot({ allowIdentityFallback: true })
         ) {
-          restoreLateVisibleSponsoredSuppression(unit, "boundary-changed");
+          restoreSuppressedFeedUnit(unit, "boundary-changed");
         }
         return;
       }
 
       if (!markCurrentRoot()) {
-        restoreLateVisibleSponsoredSuppression(unit, "boundary-changed");
+        restoreSuppressedFeedUnit(unit, "boundary-changed");
       }
     };
 
@@ -749,17 +857,19 @@
         "role"
       ]
     });
-    lateVisibleSponsoredSuppressions.set(unit, suppression);
+    suppressedFeedUnits.set(unit, suppression);
     if (!markCurrentRoot()) {
-      restoreLateVisibleSponsoredSuppression(unit, "initial-boundary-failed");
+      restoreSuppressedFeedUnit(unit, "initial-boundary-failed");
       return false;
     }
 
-    queueRuntimeStatIncrement(deps, "removedSponsored");
-    debugFeedCleanup("feed-sponsored-late-suppressed", {
+    queueRuntimeStatIncrement(deps, statKey);
+    debugFeedCleanup("feed-unit-suppressed-without-native-hide", {
       actionLabel: target.querySelector(
         '[role="button"][aria-label^="Actions for this post" i]'
-      )?.getAttribute("aria-label") || ""
+      )?.getAttribute("aria-label") || "",
+      blockedLabel,
+      statKey
     });
     return true;
   }
@@ -1109,9 +1219,11 @@
       const kind = module.getAttribute(HIDDEN_FEED_MODULE_ATTRIBUTE);
       const stillMatches = kind === "stories"
         ? isVerifiedStoriesRegion(module)
-        : kind === "reels" &&
-          getExactLabeledRegions(module, "reels")
-            .some((region) => getReelsModuleRoot(region) === module);
+        : kind === "reels"
+          ? getExactLabeledRegions(module, "reels")
+            .some((region) => getReelsModuleRoot(region) === module)
+          : kind === "people-you-may-know" &&
+            isVerifiedPeopleYouMayKnowModule(module);
       if (!stillMatches) {
         module.removeAttribute(HIDDEN_FEED_MODULE_ATTRIBUTE);
       }
@@ -1131,25 +1243,105 @@
     }
   }
 
-  function getExactSponsoredReelMarkers(root = document) {
-    return getMatchingElements(root, 'span, a, [role="link"]')
-      .filter((element) => {
-        if (
-          !(element instanceof Element) ||
-          normalizeText(element.textContent) !== "sponsored"
-        ) {
+  function isExactSponsoredReelLabel(element) {
+    const label = element instanceof Element
+      ? normalizeText(element.textContent)
+      : "";
+    if (
+      !(element instanceof Element) ||
+      (label !== "sponsored" && label !== "ad")
+    ) {
+      return false;
+    }
+
+    const isLeafLabel = ![...element.children].some((child) => {
+      return normalizeText(child.textContent) === label;
+    });
+    if (!isLeafLabel || label !== "ad") {
+      return isLeafLabel;
+    }
+
+    if (element.closest(`[${HIDDEN_SPONSORED_REEL_ATTRIBUTE}]`)) {
+      return true;
+    }
+
+    const videoPlayer = element.closest(
+      '[role="group"][aria-label="Video player" i]'
+    );
+    if (!(videoPlayer instanceof Element)) {
+      return false;
+    }
+
+    const markerRect = element.getBoundingClientRect();
+    const playerRect = videoPlayer.getBoundingClientRect();
+    return (
+      markerRect.width > 0 &&
+      markerRect.height > 0 &&
+      markerRect.height <= 48 &&
+      markerRect.top >= playerRect.top + playerRect.height * 0.5 &&
+      markerRect.bottom <= playerRect.bottom + 4
+    );
+  }
+
+  function isExternalReelDestinationLink(element) {
+    if (!(element instanceof HTMLAnchorElement)) {
+      return false;
+    }
+
+    let destination;
+    try {
+      destination = new URL(element.href, window.location.href);
+    } catch (_error) {
+      return false;
+    }
+
+    const hostname = destination.hostname.toLowerCase();
+    const isFacebookHost =
+      hostname === "facebook.com" || hostname.endsWith(".facebook.com");
+    const isExternalDestination =
+      hostname === "l.facebook.com" ||
+      destination.pathname === "/l.php" ||
+      !isFacebookHost;
+    return isExternalDestination && (
+      element.target === "_blank" ||
+      element.rel.toLowerCase().includes("nofollow")
+    );
+  }
+
+  function isSponsoredReelCta(element) {
+    return (
+      element instanceof HTMLAnchorElement &&
+      SPONSORED_REEL_CTA_LABELS.has(normalizeText(element.textContent)) &&
+      isExternalReelDestinationLink(element)
+    );
+  }
+
+  function getSponsoredReelMarkers(root = document) {
+    const candidates = new Set(
+      getMatchingElements(root, 'span, a, [role="link"]')
+    );
+    for (const element of [...candidates]) {
+      const owningLink = element.closest('a, [role="link"]');
+      if (owningLink instanceof Element) {
+        candidates.add(owningLink);
+      }
+    }
+
+    return [...candidates].filter((element) => {
+        if (!(element instanceof Element)) {
           return false;
         }
 
-        const hasNestedExactMarker = [...element.children].some((child) => {
-          return normalizeText(child.textContent) === "sponsored";
-        });
-        if (hasNestedExactMarker) {
-          return false;
-        }
-
-        return !!element.closest(
+        const videoPlayer = element.closest(
           '[role="group"][aria-label="Video player" i]'
+        );
+        if (!(videoPlayer instanceof Element)) {
+          return false;
+        }
+
+        return (
+          isExactSponsoredReelLabel(element) ||
+          isSponsoredReelCta(element)
         );
       });
   }
@@ -1178,10 +1370,8 @@
         const hasViewportItemGeometry =
           rect.width >= viewportWidth * 0.75 &&
           rect.height >= viewportHeight * 0.75;
-        const hasAdDestination =
-          node.querySelectorAll(
-            'a[target="_blank"], a[rel*="nofollow"]'
-          ).length >= 1;
+        const hasAdDestination = [...node.querySelectorAll("a")]
+          .some(isExternalReelDestinationLink);
 
         if (hasViewportItemGeometry && hasAdDestination) {
           return node;
@@ -1216,14 +1406,13 @@
         rect.width < viewportWidth * 0.75 ||
         rect.height < viewportHeight * 0.75
       )) ||
-      item.querySelectorAll(
-        'a[target="_blank"], a[rel*="nofollow"]'
-      ).length < 1
+      ![...item.querySelectorAll("a")]
+        .some(isExternalReelDestinationLink)
     ) {
       return false;
     }
 
-    return getExactSponsoredReelMarkers(item).some((marker) => {
+    return getSponsoredReelMarkers(item).some((marker) => {
       return allowHidden
         ? item.contains(marker)
         : resolveSponsoredReelItem(marker) === item;
@@ -1240,6 +1429,7 @@
     if (clearRemovedRoutes) {
       removedSponsoredReelRoutes.clear();
       countedSponsoredReelRoutes.clear();
+      sponsoredReelSkipAttempts.clear();
     }
   }
 
@@ -1295,6 +1485,61 @@
     return rect.top <= viewportCenter && rect.bottom >= viewportCenter;
   }
 
+  function getNextReelControl() {
+    return [...document.querySelectorAll(
+      'button[aria-label="Next Card" i], [role="button"][aria-label="Next Card" i]'
+    )].find((control) => {
+      return (
+        control instanceof HTMLElement &&
+        !control.matches(":disabled, [aria-disabled=\"true\"]") &&
+        isVisible(control)
+      );
+    }) || null;
+  }
+
+  function skipActiveSponsoredReel(item, deps = {}, routeKey = "") {
+    if (
+      !(item instanceof Element) ||
+      !routeKey ||
+      !isActiveReelItem(item) ||
+      !isVerifiedSponsoredReelItem(item)
+    ) {
+      return false;
+    }
+
+    const now = Date.now();
+    const attempt = sponsoredReelSkipAttempts.get(routeKey) || {
+      count: 0,
+      lastAttemptAt: 0
+    };
+    if (attempt.count >= 2 || now - attempt.lastAttemptAt < 250) {
+      return false;
+    }
+
+    const nextControl = getNextReelControl();
+    if (!(nextControl instanceof HTMLElement)) {
+      return false;
+    }
+
+    attempt.count += 1;
+    attempt.lastAttemptAt = now;
+    sponsoredReelSkipAttempts.set(routeKey, attempt);
+    removedSponsoredReelRoutes.add(routeKey);
+    countSponsoredReelSkip(item, deps, routeKey);
+
+    const activated = pressElement(nextControl, {
+      dispatchKeyboard: false,
+      dispatchSyntheticClick: false,
+      dispatchNativeClick: true
+    });
+    debugFeedCleanup("sponsored-reel-native-skip", {
+      activated,
+      attempt: attempt.count,
+      routeKey
+    });
+    return activated;
+  }
+
   function runSponsoredReelFiltering(root = document, deps = {}) {
     const settings = getRuntimeSettings(deps);
     if (
@@ -1322,7 +1567,7 @@
     reconcileSponsoredReelItems();
 
     const items = new Set(
-      getExactSponsoredReelMarkers(root)
+      getSponsoredReelMarkers(root)
         .map(resolveSponsoredReelItem)
         .filter((item) => item instanceof Element)
     );
@@ -1333,10 +1578,15 @@
         continue;
       }
 
-      const routeKey =
-        isActiveReelItem(item) ? currentRouteKey : "";
+      const routeKey = isActiveReelItem(item) ? currentRouteKey : "";
       if (routeKey) {
-        removedSponsoredReelRoutes.add(routeKey);
+        if (skipActiveSponsoredReel(item, deps, routeKey)) {
+          actionCount += 1;
+        }
+        /* Never collapse the active scroll-snap item. Removing it from layout
+           can leave Facebook's URL and comment sidebar bound to the skipped ad.
+           Wait for the native Next control and fail open if it is unavailable. */
+        continue;
       }
       if (hideSponsoredReelItem(item, deps, routeKey)) {
         actionCount += 1;
@@ -1410,6 +1660,34 @@
     }
 
     return null;
+  }
+
+  function isVerifiedPeopleYouMayKnowModule(module) {
+    if (
+      !(module instanceof Element) ||
+      !module.closest('[role="main"]') ||
+      hasPostFooterSignals(module)
+    ) {
+      return false;
+    }
+
+    const hasExactHeading = getMatchingElements(
+      module,
+      'h1, h2, h3, h4, [role="heading"]'
+    ).some((heading) => {
+      return normalizeText(heading.textContent) === "people you may know";
+    });
+    if (!hasExactHeading) {
+      return false;
+    }
+
+    const suggestionLinks = module.querySelectorAll(
+      'a[href*="/friends/suggestions/"]'
+    ).length;
+    const recommendationControls = module.querySelectorAll(
+      '[aria-label^="Add friend" i], [aria-label^="Remove recommendation" i]'
+    ).length;
+    return suggestionLinks >= 2 || recommendationControls >= 2;
   }
 
   function getSidebarSponsoredContainer(start) {
@@ -1801,9 +2079,11 @@
   function hidePeopleYouMayKnow(root = document, deps = {}) {
     const settings = getRuntimeSettings(deps);
     if (!settings?.enableFeedFilter || !settings?.enableBlockPeopleYouMayKnow) {
+      restoreHiddenFeedModules("people-you-may-know");
       return;
     }
 
+    reconcileHiddenFeedModules(root);
     const mainContainers = getMainContainers(root);
 
     for (const container of mainContainers) {
@@ -1815,11 +2095,16 @@
         }
 
         const target = getPeopleYouMayKnowContainer(candidate);
-        if (!target) {
+        if (!isVerifiedPeopleYouMayKnowModule(target)) {
           continue;
         }
 
-        markHidden(target, "removedPeopleYouMayKnow", deps);
+        markFeedModuleHidden(
+          target,
+          "people-you-may-know",
+          "removedPeopleYouMayKnow",
+          deps
+        );
       }
     }
   }
@@ -1890,55 +2175,45 @@
     );
   }
 
+  function isSafeDirectSuppressionCandidate(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    /*
+      Direct suppression leaves the React-owned virtualized unit connected, so
+      it can safely act earlier than a native Hide transition. Scan every
+      mounted unit below the viewport buffer instead of waiting until it enters
+      a narrow two-viewport window; that gives slow ad metadata time to hydrate
+      before the user reaches the card.
+    */
+    const rect = element.getBoundingClientRect();
+    const safeTop = window.innerHeight + Math.max(160, window.innerHeight * 0.2);
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      rect.top >= safeTop
+    );
+  }
+
   function isStartupVisibleSponsoredCandidate(element, deps = {}) {
     if (
       !(element instanceof Element) ||
       document.visibilityState !== "visible" ||
       typeof deps.hasTrustedPageInteraction !== "function" ||
-      deps.hasTrustedPageInteraction()
+      deps.hasTrustedPageInteraction() ||
+      typeof deps.getRuntimeAgeMs !== "function" ||
+      deps.getRuntimeAgeMs() > 8000
     ) {
       return false;
     }
 
     /*
       A Sponsored unit already inside the first viewport can never satisfy the
-      upcoming-card rule. It is safe to start Facebook's native hide before the
-      first trusted input because the pointer-down handler cancels any queued
-      feed pass before it records that input. beginNativeHideTransition()
-      collapses only the unit's direct inner root before invoking the native
-      control; the outer virtualized slot and Facebook's event ownership remain
-      connected.
-    */
-    const rect = element.getBoundingClientRect();
-    return (
-      rect.width > 0 &&
-      rect.height > 0 &&
-      rect.bottom > 0 &&
-      rect.top < window.innerHeight
-    );
-  }
-
-  function isLateVisibleSponsoredCandidate(element, deps = {}) {
-    if (
-      !(element instanceof Element) ||
-      document.visibilityState !== "visible" ||
-      typeof deps.hasTrustedPageInteraction !== "function" ||
-      !deps.hasTrustedPageInteraction() ||
-      (
-        typeof deps.isRecentlyInteractedFeedUnit === "function" &&
-        deps.isRecentlyInteractedFeedUnit(element)
-      )
-    ) {
-      return false;
-    }
-
-    /*
-      Slow Chromium variants can expose a Sponsored marker only after its card
-      is already visible and the user has interacted with the page. Replacing
-      that visible React unit through Facebook's native Hide action can recycle
-      its permalink handler onto a neighbour. The late path therefore collapses
-      only the verified direct inner root and keeps the outer virtualized unit
-      connected and owned by Facebook.
+      upcoming-card rule. During the bounded startup window, direct suppression
+      may collapse its identity-verified inner root before the first trusted
+      input. The pointer-down handler cancels any queued feed pass before it
+      records that input, and the outer virtualized slot remains connected.
     */
     const rect = element.getBoundingClientRect();
     return (
@@ -1953,22 +2228,18 @@
     const explicitMarkers = getMatchingElements(
       container,
       '[data-ad-rendering-role*="sponsored" i]'
-    ).filter((marker) => isNearViewport(marker));
+    );
     const structuralMarkers = getMatchingElements(
       container,
       '[data-ad-rendering-role^="cta" i]'
     ).filter((marker) => {
-      if (!isNearViewport(marker)) {
-        return false;
-      }
-
       const target = getSponsoredPostContainer(marker);
       return hasSponsoredStructuralMetadata(target);
     });
     const candidateLinks = getMatchingElements(
       container,
       'a[href*="__cft__"], [role="link"][href*="__cft__"]'
-    ).filter((link) => isNearViewport(link));
+    );
 
     return {
       candidateLinks,
@@ -2201,6 +2472,46 @@
     }
   }
 
+  function hideBlockedLabelPostsWithoutNativeHide(root = document, deps = {}) {
+    const settings = getRuntimeSettings(deps);
+    if (!settings?.enableFeedFilter) {
+      return;
+    }
+
+    const blockedLabels = getEnabledPostLabels(settings);
+    if (blockedLabels.length === 0) {
+      return;
+    }
+
+    const handledUnits = new Set();
+    for (const container of getMainContainers(root)) {
+      for (const button of getMatchingElements(container, '[role="button"]')) {
+        if (!isBlockedPostLabelButton(button, blockedLabels)) {
+          continue;
+        }
+
+        const blockedLabel = getBlockedPostLabel(button, blockedLabels);
+        const target = getPostContainerFromLabelButton(button);
+        const statKey = blockedLabel === "join"
+          ? "removedJoinPosts"
+          : "removedFollowPosts";
+        const unit = getNativeHideFeedUnit(target, statKey);
+        const isUpcomingCandidate = unit instanceof Element && isSafeNativeHideCandidate(unit);
+        if (!unit || !isUpcomingCandidate || handledUnits.has(unit)) {
+          continue;
+        }
+
+        handledUnits.add(unit);
+        suppressFeedUnitWithoutNativeHide(
+          unit,
+          target,
+          { blockedLabel, statKey },
+          deps
+        );
+      }
+    }
+  }
+
   function runSponsoredFeedFiltering(root = document, deps = {}) {
     /*
       Remove the extension-owned placeholder left by the short-lived masking
@@ -2209,11 +2520,12 @@
     document.querySelector("[data-faceberg-sponsored-mask-host]")?.remove();
 
     const settings = getRuntimeSettings(deps);
-    reconcileLateVisibleSponsoredSuppressions(deps);
+    reconcileSuppressedFeedUnits(deps);
     hideStoriesContainers(root, deps);
     hideReelsContainers(root, deps);
+    hidePeopleYouMayKnow(root, deps);
     if (!settings?.enableFeedFilter) {
-      restoreAllLateVisibleSponsoredSuppressions("feed-filter-disabled");
+      restoreAllSuppressedFeedUnits("feed-filter-disabled");
       compactHiddenFeedbackWithin(root, deps);
       return;
     }
@@ -2228,12 +2540,18 @@
 
     compactHiddenFeedbackWithin(root, deps);
     hideSidebarSponsored(root, deps);
-    hideBlockedLabelPostsNatively(root, deps);
+    if (ENABLE_NATIVE_FEED_HIDE_ACTIONS) {
+      hideBlockedLabelPostsNatively(root, deps);
+    } else {
+      hideBlockedLabelPostsWithoutNativeHide(root, deps);
+    }
 
     if (settings.enableBlockSponsoredPosts === false) {
-      restoreAllLateVisibleSponsoredSuppressions(
-        "sponsored-filter-disabled"
-      );
+      for (const [unit, suppression] of [...suppressedFeedUnits.entries()]) {
+        if (suppression.statKey === "removedSponsored") {
+          restoreSuppressedFeedUnit(unit, "sponsored-filter-disabled");
+        }
+      }
       return;
     }
 
@@ -2253,34 +2571,33 @@
       for (const marker of new Set(markers)) {
         const target = getSponsoredPostContainer(marker);
         const unit = getNativeHideFeedUnit(target, "removedSponsored");
-        const isUpcomingCandidate =
-          unit instanceof Element && isSafeNativeHideCandidate(unit);
+        const isUpcomingCandidate = unit instanceof Element && (
+          ENABLE_NATIVE_FEED_HIDE_ACTIONS
+            ? isSafeNativeHideCandidate(unit)
+            : isSafeDirectSuppressionCandidate(unit)
+        );
         const isStartupVisibleCandidate =
           unit instanceof Element &&
           isStartupVisibleSponsoredCandidate(unit, deps);
-        const isLateVisibleCandidate =
-          unit instanceof Element &&
-          isLateVisibleSponsoredCandidate(unit, deps);
+        const isEligibleCandidate =
+          isUpcomingCandidate || isStartupVisibleCandidate;
         if (
           !unit ||
-          (
-            !isUpcomingCandidate &&
-            !isStartupVisibleCandidate &&
-            !isLateVisibleCandidate
-          ) ||
+          !isEligibleCandidate ||
           handledUnits.has(unit)
         ) {
           continue;
         }
 
         handledUnits.add(unit);
-        if (
-          isLateVisibleCandidate &&
-          !isUpcomingCandidate &&
-          !isStartupVisibleCandidate
-        ) {
+        if (!ENABLE_NATIVE_FEED_HIDE_ACTIONS) {
           suppressedLateVisibleCount += Number(
-            suppressLateVisibleSponsored(unit, target, deps)
+            suppressFeedUnitWithoutNativeHide(
+              unit,
+              target,
+              { statKey: "removedSponsored" },
+              deps
+            )
           );
         } else if (activateNativeSponsoredHide(unit, target, deps)) {
           activatedTargetCount += 1;

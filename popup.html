@@ -228,6 +228,108 @@
               </ul>
             </div>
 
+            <section class="fb-about-changelog" aria-labelledby="whatsNewTitle">
+              <div class="fb-about-changelog-heading">
+                <h3 class="fb-about-subtitle" id="whatsNewTitle">What's new</h3>
+                <span class="fb-release-badge" id="aboutVersion" aria-label="Current release version"></span>
+              </div>
+              <p class="fb-release-date"><time datetime="2026-08-16">August 16, 2026</time></p>
+              <ul class="fb-changelog-list">
+                <li>Chrome feed ads are detected across all mounted cards below the viewport buffer.</li>
+                <li>Stable first-screen ads are handled only during bounded startup before interaction.</li>
+              </ul>
+
+              <details class="fb-release-history">
+                <summary>Previous releases</summary>
+                <div class="fb-release-history-body">
+                  <section class="fb-release-entry" aria-labelledby="release1215">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1215">v1.2.15</h4>
+                      <time datetime="2026-08-16">August 16, 2026</time>
+                    </div>
+                    <p>Bound suppression to stable post identity and removed the unsafe pre-paint card rule.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1214">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1214">v1.2.14</h4>
+                      <time datetime="2026-08-13">August 13, 2026</time>
+                    </div>
+                    <p>Recognized the compact Reel Ad badge and Play game CTA while rejecting internal Facebook destinations.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1213">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1213">v1.2.13</h4>
+                      <time datetime="2026-08-13">August 13, 2026</time>
+                    </div>
+                    <p>Added early Reel-ad CTA detection and native Next navigation for active ads.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1212">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1212">v1.2.12</h4>
+                      <time datetime="2026-08-13">August 13, 2026</time>
+                    </div>
+                    <p>Removed blank Sponsored-card placeholders and moved main-feed ad suppression to structural pre-paint detection.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1211">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1211">v1.2.11</h4>
+                      <time datetime="2026-08-13">August 13, 2026</time>
+                    </div>
+                    <p>Attempted height-preserving late-card masking; superseded because it could leave large blank gaps.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1210">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1210">v1.2.10</h4>
+                      <time datetime="2026-08-13">August 13, 2026</time>
+                    </div>
+                    <p>Prevented feed cleanup from collapsing visible or already-passed cards during upward scrolling.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release129">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release129">v1.2.9</h4>
+                      <time datetime="2026-08-11">August 11, 2026</time>
+                    </div>
+                    <p>Bound Reel comments to the current Reel and refreshed stale recycled sidebars once.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release128">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release128">v1.2.8</h4>
+                      <time datetime="2026-08-11">August 11, 2026</time>
+                    </div>
+                    <p>Stopped stale post watchers and removed the native Hide transition that could misroute recycled feed links.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release127">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release127">v1.2.7</h4>
+                      <time datetime="2026-08-04">August 4, 2026</time>
+                    </div>
+                    <p>Restored anti-refresh protection as the default while preserving explicit saved opt-outs.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release126">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release126">v1.2.6</h4>
+                      <time datetime="2026-08-04">August 4, 2026</time>
+                    </div>
+                    <p>Fixed Reel comment automation, restored People You May Know cleanup, corrected settings fallback, and added this changelog.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release125">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release125">v1.2.5</h4>
+                      <time datetime="2026-07-30">July 30, 2026</time>
+                    </div>
+                    <p>Improved slow-browser comment sorting, bounded All comments retries, and stabilized late-loading Sponsored post cleanup.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release124">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release124">v1.2.4</h4>
+                      <time datetime="2026-07-29">July 29, 2026</time>
+                    </div>
+                    <p>Added independent cleanup controls, Sponsored Reel removal, Stories control, and separate comment sorting and expansion settings.</p>
+                  </section>
+                </div>
+              </details>
+            </section>
+
             <div class="fb-about-note">
               <strong>🌐 Language:</strong> Faceberg currently supports English-language Facebook only. If you'd like support for another language or additional functionality, feel free to request it through the extension's store page.
             </div>

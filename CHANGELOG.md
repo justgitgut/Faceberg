@@ -1,6 +1,149 @@
 # Changelog
 
-## Unreleased
+## 2026-08-16 - v1.2.16
+
+### Fixed
+
+- Restored Chrome main-feed ad coverage without weakening the v1.2.15 recycled
+  post safeguards. Faceberg now scans every mounted, identity-verified
+  Sponsored card below the viewport safety buffer instead of waiting for a
+  narrow two-viewport window.
+- A stable Sponsored card already in the first viewport may be suppressed only
+  during the first eight seconds and before any trusted page interaction. This
+  covers first-load ads without reintroducing interaction-time feed jumps.
+- Validated the missed Chrome card against its live compact `Ad` marker, long
+  `__cft__` identity, ad-only rendering roles, and external CTA bundle.
+
+## 2026-08-16 - v1.2.15
+
+### Fixed
+
+- Main-feed suppression now requires a stable post permalink identity or a
+  sufficiently specific Facebook context token. The generic `Actions for this
+  post` label is no longer treated as an identity shared across recycled cards.
+- A suppressed card is restored immediately if its marker or identity
+  disappears or changes while Facebook recycles the virtualized feed unit.
+- Removed the structural pre-paint CSS shortcut, which could collapse a
+  React-owned card before Faceberg proved that the current card was still the
+  Sponsored post. This closes the intermittent wrong-post or unavailable-post
+  route seen during slower Vivaldi feed hydration.
+
+## 2026-08-13 - v1.2.14
+
+### Fixed
+
+- Added Facebook's compact `Ad` badge and `Play game` CTA to Sponsored Reel
+  detection after validating both signals against a live missed ad.
+- Tightened Reel ad destinations so internal Facebook profile links no longer
+  satisfy the outbound-link requirement. A qualifying destination must use
+  Facebook's external redirect or a genuinely non-Facebook hostname.
+
+## 2026-08-13 - v1.2.13
+
+### Fixed
+
+- Sponsored Reels no longer wait for Facebook's delayed visible `Sponsored`
+  label. Faceberg now recognizes the earlier ad CTA plus its explicit external
+  destination while retaining the full-screen Reel geometry checks.
+- An active Sponsored Reel now advances through Facebook's native `Next Card`
+  control instead of being removed from the scroll-snap layout. This keeps the
+  URL, visible Reel, and comment sidebar on the same item. Preloaded off-screen
+  ad items can still be suppressed before entry.
+
+## 2026-08-13 - v1.2.12
+
+### Fixed
+
+- Removed the v1.2.11 height-preserving Sponsored mask because it could leave
+  full-card blank gaps in the feed.
+- Main-feed filtering now uses Facebook's ad-only structural rendering bundle
+  to suppress verified Sponsored cards during style calculation, before they
+  participate in a painted feed layout. The JavaScript fallback scans the
+  mounted feed but collapses cards only while safely below the viewport; it no
+  longer masks visible cards, reserves their height, or compensates scrolling.
+
+## 2026-08-13 - v1.2.11
+
+### Fixed
+
+- Attempted to restore late Vivaldi filtering with a height-preserving mask.
+  Superseded by v1.2.12 because the mask left unacceptable full-card gaps.
+
+## 2026-08-13 - v1.2.10
+
+### Fixed
+
+- Stopped feed cleanup from collapsing Sponsored, Follow, or Join cards while
+  they are visible or already above the viewport. Those layout changes could
+  make Facebook's virtualized feed repeatedly jump backward when scrolling up.
+- Main-feed suppression now acts only on verified cards safely below the
+  viewport. A card detected too late remains visible instead of changing feed
+  height underneath the user's active scroll.
+
+## 2026-08-11 - v1.2.9
+
+### Fixed
+
+- Stopped the first Reel's comment sidebar from retaining automation ownership
+  after moving to another Reel. Reel resolution now ignores mutation-local
+  roots, binds `/reel/<id>` pages to the exact current permalink, and waits
+  until the matching Reel context mounts before sorting or expanding comments.
+- Added a bounded recovery for Facebook's own recycled sidebar: when a new Reel
+  URL appears but the mounted comment timestamps still belong to the previous
+  Reel, Faceberg toggles the current Reel's Comment control closed and open once
+  to request the correct discussion.
+- Improved `/reels` browsing without a route ID by preferring the visible Reel
+  nearest the viewport center instead of a previously populated comment panel.
+
+## 2026-08-11 - v1.2.8
+
+### Fixed
+
+- Stopped retained or recycled comment-dialog observers from acting on an old
+  post after a newer post begins opening. Comment automation now suspends at
+  pointer-down, rejects hidden, inert, zero-area, non-topmost, and route-stale
+  surfaces, and tears down watchers that no longer own the active discussion.
+- Removed production use of Facebook's native **Hide post/Hide ad** transition
+  for main-feed Sponsored, Follow, and Join cards. That transition could recycle
+  a card's permalink handler onto a neighbor, producing the intermittent wrong
+  post or unavailable-post dialog. Faceberg now suppresses only the verified
+  direct inner root, keeps the virtualized unit connected, and restores it when
+  Facebook recycles the unit for a different post.
+
+## 2026-08-04 - v1.2.7
+
+### Fixed
+
+- Restored anti-refresh protection as the default when the user has not saved
+  an explicit preference. The popup, content runtime, and background worker had
+  all regressed to `enableAntiRefresh: false`, leaving guard v13 installed but
+  disabled, automatic navigation unsuppressed, and Facebook tabs discardable.
+- Kept explicit saved choices authoritative: users who deliberately turn
+  anti-refresh off remain opted out, while fresh or unset installations are
+  protected consistently across every settings consumer.
+
+## 2026-08-04 - v1.2.6
+
+### Added
+
+- Added an in-extension changelog to the **About** tab. The current release is
+  shown first and earlier release summaries remain available in an expandable
+  history.
+
+### Fixed
+
+- Resumed Reel comment automation after `/reel/<id>` SPA navigation. The
+  transition guard previously stayed suspended after the non-dialog Reel
+  sidebar appeared, preventing both `All comments` selection and visible reply
+  or comment-text expansion.
+- Restored the **Hide People You May Know** option. The previous physical DOM
+  removal path had been disabled for Facebook React safety, leaving the popup
+  toggle wired but ineffective. Faceberg now uses the same reversible,
+  non-destructive module marker as Reels and Stories and restores the module
+  immediately when the option is disabled.
+- Corrected sync/local settings fallback in the popup, page runtime, and
+  background worker. A missing key from one browser storage area can no longer
+  supply a default that overwrites the user's real value from the other area.
 
 ## 2026-07-30 - v1.2.5
 

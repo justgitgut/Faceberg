@@ -37,7 +37,7 @@
   }
 
   const DEFAULT_SETTINGS = {
-    enableAntiRefresh: false,
+    enableAntiRefresh: true,
     enableFeedFilter: true,
     enablePostExpansion: true,
     enableCommentSortAll: true,
@@ -101,12 +101,10 @@
   const postExpanderAttemptState = new WeakMap();
   let lastObservedUrl = window.location.href;
   let runtimeReady = false;
+  const runtimeCreatedAt = Date.now();
   let scrollSnapshotTimer = 0;
   let scrollRestoreUntil = 0;
   let lastUserScrollIntentAt = 0;
-  let lastTrustedFeedInteractionAt = 0;
-  let lastTrustedFeedInteractionUnit = null;
-  const RECENT_FEED_INTERACTION_WINDOW_MS = 1200;
   const SCROLL_SNAPSHOT_STORAGE_KEY = "__facebergScrollSnapshotsV1";
   const SCROLL_SNAPSHOT_MAX_AGE_MS = 2 * 60 * 1000;
   const ANTI_REFRESH_NAVIGATION_EVENT = "__facebergAntiRefreshNavigation";
@@ -155,22 +153,7 @@
   const runtimeDeps = {
     getSettings: () => settings,
     hasTrustedPageInteraction: () => lastUserScrollIntentAt > 0,
-    isRecentlyInteractedFeedUnit: (unit) => {
-      if (
-        !(unit instanceof Element) ||
-        !(lastTrustedFeedInteractionUnit instanceof Element) ||
-        Date.now() - lastTrustedFeedInteractionAt >
-          RECENT_FEED_INTERACTION_WINDOW_MS
-      ) {
-        return false;
-      }
-
-      return (
-        unit === lastTrustedFeedInteractionUnit ||
-        unit.contains(lastTrustedFeedInteractionUnit) ||
-        lastTrustedFeedInteractionUnit.contains(unit)
-      );
-    },
+    getRuntimeAgeMs: () => Date.now() - runtimeCreatedAt,
     isCommentAutomationSuspended: () => commentAutomationSuspended,
     queueStatIncrement
   };
@@ -433,6 +416,7 @@
   let commentWakeFrame = 0;
   let closeDialogObserver = null;
   let pendingSpaCommentUrl = "";
+  let pendingReelSidebarRefresh = null;
   const pendingHomeFeedRoots = new Set();
   let lastFullDocumentPassAt = 0;
   const pendingRunAllRoots = new Set();
@@ -516,6 +500,11 @@
 
   function suspendFeedAutomationForNavigation() {
     feedAutomationSuspended = true;
+    /* Existing comment-surface observers must become inert before Facebook's
+       click handler starts swapping URLs and recycled dialog nodes. Without
+       this, a retained controller can press controls in the post being closed
+       while the next post is still mounting. */
+    commentAutomationSuspended = true;
     cancelPendingFeedAutomation();
   }
 
@@ -665,6 +654,94 @@
     return /\/reel(?:s)?(?:\/|$)/i.test(
       String(window.location.pathname || "")
     );
+  }
+
+  function getReelRouteId(href = window.location.href) {
+    try {
+      return new URL(href, window.location.href).pathname.match(/\/reel\/(\d+)/i)?.[1] || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function getVisibleReelCommentSidebar() {
+    return [...document.querySelectorAll('[role="complementary"]')].find((surface) => {
+      if (!(surface instanceof Element) || !isVisible(surface) || !hasCommentSurfaceSignals(surface)) {
+        return false;
+      }
+
+      const rect = surface.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight;
+    }) || null;
+  }
+
+  function reelSidebarMatchesRoute(surface, reelId) {
+    if (!(surface instanceof Element) || !reelId) {
+      return false;
+    }
+
+    return [...surface.querySelectorAll('a[href*="/reel/"]')].some((link) => {
+      return getReelRouteId(link.href) === reelId;
+    });
+  }
+
+  function getActiveReelCommentToggle() {
+    const viewportCenterY = (window.innerHeight || 0) / 2;
+    return [...document.querySelectorAll('[role="button"][aria-label], button[aria-label]')]
+      .filter((button) => {
+        if (!(button instanceof Element) || normalizeText(button.getAttribute("aria-label")) !== "comment") {
+          return false;
+        }
+        const rect = button.getBoundingClientRect();
+        return isVisible(button) && rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight;
+      })
+      .sort((left, right) => {
+        const leftRect = left.getBoundingClientRect();
+        const rightRect = right.getBoundingClientRect();
+        return Math.abs(leftRect.top + leftRect.height / 2 - viewportCenterY) -
+          Math.abs(rightRect.top + rightRect.height / 2 - viewportCenterY);
+      })[0] || null;
+  }
+
+  function recoverStaleReelSidebar() {
+    const refresh = pendingReelSidebarRefresh;
+    if (!refresh || refresh.url !== window.location.href) {
+      pendingReelSidebarRefresh = null;
+      return false;
+    }
+
+    const sidebar = getVisibleReelCommentSidebar();
+    if (sidebar && reelSidebarMatchesRoute(sidebar, refresh.reelId)) {
+      pendingReelSidebarRefresh = null;
+      return false;
+    }
+
+    const toggle = getActiveReelCommentToggle();
+    if (!(toggle instanceof Element)) {
+      return false;
+    }
+
+    if (refresh.phase === "close") {
+      if (sidebar || toggle.getAttribute("aria-expanded") === "true") {
+        if (pressElement(toggle)) {
+          refresh.phase = "reopen";
+          return true;
+        }
+        pendingReelSidebarRefresh = null;
+        return false;
+      }
+      refresh.phase = "reopen";
+    }
+
+    if (refresh.phase === "reopen" && !sidebar) {
+      if (pressElement(toggle)) {
+        refresh.phase = "wait-for-current";
+        return true;
+      }
+      pendingReelSidebarRefresh = null;
+    }
+
+    return false;
   }
 
   function getSponsoredReelObserverRoot() {
@@ -1066,9 +1143,10 @@
       return { ...DEFAULT_SETTINGS };
     }
 
+    const settingKeys = Object.keys(DEFAULT_SETTINGS);
     const [syncResult, localResult] = await Promise.allSettled([
-      chrome.storage.sync.get(DEFAULT_SETTINGS),
-      chrome.storage.local.get(DEFAULT_SETTINGS)
+      chrome.storage.sync.get(settingKeys),
+      chrome.storage.local.get(settingKeys)
     ]);
 
     const syncSettings = syncResult.status === "fulfilled" ? syncResult.value : {};
@@ -1943,13 +2021,13 @@
       if (isReelExperiencePath()) {
         runSponsoredReelFiltering(root);
         ensureSponsoredReelObserver();
-        if (getActiveReelCommentSurface(root)) {
+        if (getActiveReelCommentSurface(document)) {
           scheduleCommentAutomationPasses(document);
         }
         return;
       }
 
-      if (getActiveReelCommentSurface(root)) {
+      if (getActiveReelCommentSurface(document)) {
         scheduleCommentAutomationPasses(document);
         return;
       }
@@ -2271,14 +2349,6 @@
   function noteUserScrollIntent(event) {
     if (event?.isTrusted === true) {
       lastUserScrollIntentAt = Date.now();
-      const target = event.target instanceof Element ? event.target : null;
-      const feedUnit = target?.closest(
-        "[data-virtualized], [aria-posinset], div[role=\"article\"]"
-      );
-      if (feedUnit instanceof Element) {
-        lastTrustedFeedInteractionAt = lastUserScrollIntentAt;
-        lastTrustedFeedInteractionUnit = feedUnit;
-      }
     }
   }
 
@@ -2288,8 +2358,24 @@
       return false;
     }
 
+    const previousUrl = lastObservedUrl;
     lastObservedUrl = currentUrl;
     runtimePerformance.spaUrlChanges += 1;
+    const previousReelId = getReelRouteId(previousUrl);
+    const currentReelId = getReelRouteId(currentUrl);
+    const mountedReelSidebar = getVisibleReelCommentSidebar();
+    const activeReelCommentToggle = getActiveReelCommentToggle();
+    const reelCommentsWereOpen =
+      !!mountedReelSidebar ||
+      activeReelCommentToggle?.getAttribute("aria-expanded") === "true";
+    pendingReelSidebarRefresh =
+      previousReelId &&
+      currentReelId &&
+      previousReelId !== currentReelId &&
+      reelCommentsWereOpen &&
+      (!mountedReelSidebar || !reelSidebarMatchesRoute(mountedReelSidebar, currentReelId))
+        ? { url: currentUrl, reelId: currentReelId, phase: "close" }
+        : null;
     if (isPostOrMediaNavigationHref(currentUrl)) {
       commentAutomationSuspended = true;
       pendingSpaCommentUrl = currentUrl;
@@ -2355,6 +2441,26 @@
       commentAutomationSuspended = false;
       debouncedRunAll(dialog);
       return true;
+    }
+
+    /* Reel links participate in the same SPA wake path as post/media links,
+       but their comments render in an adjacent non-dialog surface. Resume as
+       soon as the isolated Reel resolver can identify that surface; otherwise
+       pendingSpaCommentUrl leaves comment automation suspended indefinitely. */
+    const reelSurface = isReelExperiencePath()
+      ? getActiveReelCommentSurface(document)
+      : null;
+    if (reelSurface instanceof Element) {
+      pendingSpaCommentUrl = "";
+      pendingReelSidebarRefresh = null;
+      feedAutomationSuspended = false;
+      commentAutomationSuspended = false;
+      debouncedRunAll(reelSurface);
+      return true;
+    }
+
+    if (isReelExperiencePath() && recoverStaleReelSidebar()) {
+      return false;
     }
 
     /*
