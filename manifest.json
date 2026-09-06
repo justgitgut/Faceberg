@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Faceberg – Block Facebook Auto-Refresh & Clean Feed",
   "short_name": "Faceberg",
-  "version": "1.2.16",
+  "version": "1.2.32",
   "description": "Block Facebook automatic feed refreshes, hide Sponsored posts, Reels and Stories, and expand posts, comments and replies.",
   "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": [
@@ -15,7 +15,7 @@
         "*://www.facebook.com/*",
         "*://web.facebook.com/*"
       ],
-      "js": ["injected.js"],
+      "js": ["main-feed-sponsored-guard.js", "injected.js"],
       "run_at": "document_start",
       "world": "MAIN"
     },

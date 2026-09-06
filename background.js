@@ -5,6 +5,7 @@
   const DEFAULT_SETTINGS = {
     enableAntiRefresh: true,
     enableFeedFilter: true,
+    enableBlockSponsoredPosts: true,
     enableBlockSponsoredSidebar: true,
     enableGoDirectlyToFeeds: false,
     groupFeedDefaultSort: "new posts"
@@ -427,6 +428,7 @@
     if (
       changes.enableAntiRefresh ||
       changes.enableFeedFilter ||
+      changes.enableBlockSponsoredPosts ||
       changes.enableBlockSponsoredSidebar ||
       changes.enableGoDirectlyToFeeds
     ) {

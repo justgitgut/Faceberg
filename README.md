@@ -7,21 +7,20 @@
 Chrome extension that declutters your Facebook feed, auto-expands posts and visible comment threads, keeps the main feed and supported group feeds sorted predictably, and offers optional anti-refresh protection.
 
 - Current development build uses a lightweight compatibility runtime: it leaves
-  Facebook-owned Home-feed DOM and normal lifecycle events intact, wakes bounded
+  Facebook-owned Home-feed DOM and normal lifecycle events intact, filters only
+  explicitly Sponsored normalized Home-feed connection edges before React sees them, wakes bounded
   comment automation only after a trusted comment/post click or on a supported
   direct post/media route, and disables only Facebook's named automatic
   stale-Home, pushed-post-close, maintained-route feed cleanup, and independent
   right-column Sponsored renderer/refetch modules.
 - Prevents the independent Sponsored sidebar component from rendering or
-  running its visibility-return refetch hook. Verified main-feed Sponsored,
-  Follow, and Join cards are suppressed only after a stable permalink or
-  Facebook context identity is available. Sponsored detection scans all mounted
-  cards below the viewport safety buffer; a stable first-viewport ad may be
-  suppressed only during a bounded startup window before any trusted input.
-  The outer virtualized unit remains connected, and suppression is removed as
-  soon as Facebook drops or changes that identity while recycling the unit.
-  Faceberg does not use native Hide, visible placeholders, pre-paint card CSS,
-  or scroll compensation.
+  running its visibility-return refetch hook. Main-feed ads are rejected from
+  Facebook's normalized Home-feed Relay connection only when the story carries
+  a linked `sponsored_data` or `th_dat_spo` record whose concrete type is
+  `SponsoredData`.
+  Follow and Join card blocking remains paused. Faceberg never collapses those
+  React-owned cards, masks Facebook's SvgWml measurement layer, or invokes the
+  native Hide path whose recycled handlers previously opened the wrong post.
 - Auto-expands truncated posts and visible comment/reply threads.
 - Switches the active post dialog, direct post page, or supported media comment
   surface to `All comments` before expanding visible comment threads.
@@ -63,15 +62,14 @@ Chrome extension that declutters your Facebook feed, auto-expands posts and visi
 4. Toggle features:
 	- Enable anti-refresh protection
 	- Enable feed cleanup
-	- Hide Sponsored feed posts
+	- Main-feed Sponsored post blocking before React layout
 	- Hide the right-column Sponsored module
 	- Remove Sponsored Reels from the full-screen Reels feed using early ad CTA
 	  evidence while keeping native Reel navigation synchronized
 	- Hide Reels modules
 	- Hide the Stories tray
 	- Hide People You May Know
-	- Hide Follow posts
-	- Hide Join posts
+	- Follow and Join post blocking (currently paused in compatibility mode)
 	- Auto-expand long posts
 	- Switch supported discussions to All comments
 	- Auto-expand replies and truncated comment text
@@ -107,14 +105,22 @@ The extension auto-refreshes open Facebook tabs on install/update so filters app
   `useRefreshCometStoriesTrayOnMaintainedRouteUnmount`, at Facebook
   module-definition time. Manual browser refresh, the feed refresh pill,
   pagination, media, and routing modules remain native.
+- `main-feed-sponsored-guard.js`: is manifest-injected into Facebook's MAIN
+  world at `document_start`. Its primary path wraps Facebook's named
+  `CometNewsFeedConnectionHandler.update()` method. After the native update it
+  removes only normalized Relay edges whose node exposes an explicit
+  `th_dat_spo` or `sponsored_data` record of type `SponsoredData`, before Relay
+  publishes the connection to feed layout. Earlier exact stream and payload
+  interception remains as a bounded fallback for later-delivered edges. The
+  content script relays the saved Sponsored setting; no rendered card, story
+  component, or feed geometry is changed.
 - `injected.js`: installs a document-start, setting-controlled return guard. It
   observes hidden/visible transitions without suppressing visibility or focus,
   rejects only cancellable automatic reloads and non-user Home-route resets
   during the return window, and leaves `fetch` and XMLHttpRequest untouched.
 - `content.js`: uses scoped DOM/navigation observers to react to feed, sidebar,
-  Reel-viewer, dialog, sorter, and reply changes. Sponsored feed mutations are
-  processed card-locally in the observer turn so a busy Chromium main thread
-  cannot starve cleanup. Exact standalone Reels and Stories module roots are
+  Reel-viewer, dialog, sorter, and reply changes. It never suppresses an
+  ordinary rendered feed card. Exact standalone Reels and Stories module roots are
   hidden with a reversible marker while their React-owned nodes remain
   connected; other work is coalesced into the next rendering frame.
 - `popup.html` + `popup.js`: UI and storage-backed settings for feature toggles, grouped activity stats, period switching, saved-time estimates, debug-information export, and the in-extension changelog.
@@ -122,12 +128,13 @@ The extension auto-refreshes open Facebook tabs on install/update so filters app
 
 ## Automation Boundary
 
-- Main-feed cleanup leaves React-owned outer feed units intact so Facebook
-  retains native scrolling, loading, click routing, and media controls.
-  Sponsored, Follow, and Join cards use a verified inner-root-only suppression
-  boundary without invoking native Hide and are restored before paint if React
-  recycles the unit for ordinary content. Experimental feedback compaction is
-  limited to already-rendered native hidden-feedback payloads.
+- Main-feed cleanup leaves every rendered React-owned feed card entirely native
+  so Facebook retains scrolling, loading, click routing, media controls, and
+  its bounded virtualizer render window. Explicit Sponsored stream edges are
+  rejected before React layout; Follow and Join toggles remain stored for a
+  future supported boundary and are visibly paused in the popup.
+  Experimental feedback compaction is limited to already-rendered native
+  hidden-feedback payloads.
 - Reels and Stories are treated as standalone modules rather than ordinary post
   cards. Faceberg hides only roots that pass exact structural checks, keeps
   those roots connected to React, and removes the marker immediately when the

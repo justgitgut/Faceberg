@@ -528,9 +528,12 @@
         return;
       }
 
-      input.disabled = !enabled;
-      row.classList.toggle("fb-toggle--disabled", !enabled);
-      row.setAttribute("aria-disabled", String(!enabled));
+      const compatibilityDisabled =
+        row.getAttribute("data-compatibility-disabled") === "true";
+      const disabled = !enabled || compatibilityDisabled;
+      input.disabled = disabled;
+      row.classList.toggle("fb-toggle--disabled", disabled);
+      row.setAttribute("aria-disabled", String(disabled));
     });
   }
 

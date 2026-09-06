@@ -90,6 +90,8 @@
   const ENABLE_GLOBAL_PAGE_MUTATION_OBSERVER = false;
   const POST_EXPANDER_MAX_ATTEMPTS = 4;
   const POST_EXPANDER_RETRY_COOLDOWN_MS = 250;
+  const TRUSTED_FEED_INTERACTION_PAUSE_MS = 1600;
+  const SPA_COMMENT_SURFACE_STABILIZE_MS = 1200;
   const getSessionStatKey = sharedStats.toSessionKey || ((statKey) => `session${statKey.charAt(0).toUpperCase()}${statKey.slice(1)}`);
   let settings = { ...DEFAULT_SETTINGS };
   let statsFlushQueued = false;
@@ -101,15 +103,19 @@
   const postExpanderAttemptState = new WeakMap();
   let lastObservedUrl = window.location.href;
   let runtimeReady = false;
-  const runtimeCreatedAt = Date.now();
   let scrollSnapshotTimer = 0;
   let scrollRestoreUntil = 0;
   let lastUserScrollIntentAt = 0;
+  let trustedFeedInteractionResumeTimer = 0;
   const SCROLL_SNAPSHOT_STORAGE_KEY = "__facebergScrollSnapshotsV1";
   const SCROLL_SNAPSHOT_MAX_AGE_MS = 2 * 60 * 1000;
   const ANTI_REFRESH_NAVIGATION_EVENT = "__facebergAntiRefreshNavigation";
+  const MAIN_FEED_SPONSORED_SUPPRESSED_EVENT =
+    "__facebergMainFeedSponsoredSuppressedV1";
   const SPA_NAVIGATION_EVENT = "__facebergSpaNavigationV1";
   const ANTI_REFRESH_CONFIG_KIND = "anti-refresh-config-v13";
+  const MAIN_FEED_SPONSORED_CONFIG_KIND =
+    "main-feed-sponsored-config-v1";
   const contentUtils = globalThis.FacebergContentUtils;
   if (!contentUtils) {
     return;
@@ -152,8 +158,6 @@
     : () => {};
   const runtimeDeps = {
     getSettings: () => settings,
-    hasTrustedPageInteraction: () => lastUserScrollIntentAt > 0,
-    getRuntimeAgeMs: () => Date.now() - runtimeCreatedAt,
     isCommentAutomationSuspended: () => commentAutomationSuspended,
     queueStatIncrement
   };
@@ -269,14 +273,15 @@
       return false;
     }
 
-    const control = event.target.closest(
-      'a[href], button, [role="button"], [role="link"], [tabindex]'
+    if (window.location.pathname !== "/" || event.target.closest('[role="dialog"]')) {
+      return false;
+    }
+
+    const feedUnit = event.target.closest(
+      '[data-virtualized], [aria-posinset], div[role="article"]'
     );
-    return (
-      control instanceof Element &&
-      !!control.closest('[role="main"], main') &&
-      !!control.closest('[data-virtualized], [aria-posinset], div[role="article"]')
-    );
+    return feedUnit instanceof Element &&
+      !!feedUnit.closest('[role="main"], main');
   }
 
   function scheduleUserInitiatedCommentWake() {
@@ -379,6 +384,7 @@
   }
 
   function runSponsoredFeedFiltering(root = document) {
+    contentFeed.restoreSuppressedFeedCards?.("pre-filter-reconcile");
     if (isFeedAutomationBlocked()) {
       return;
     }
@@ -416,6 +422,8 @@
   let commentWakeFrame = 0;
   let closeDialogObserver = null;
   let pendingSpaCommentUrl = "";
+  let pendingSpaCommentReadyAt = 0;
+  let pendingSpaCommentWakeTimer = 0;
   let pendingReelSidebarRefresh = null;
   const pendingHomeFeedRoots = new Set();
   let lastFullDocumentPassAt = 0;
@@ -499,6 +507,11 @@
   }
 
   function suspendFeedAutomationForNavigation() {
+    contentFeed.restoreSuppressedFeedCards?.("navigation-started");
+    if (trustedFeedInteractionResumeTimer) {
+      clearTimeout(trustedFeedInteractionResumeTimer);
+      trustedFeedInteractionResumeTimer = 0;
+    }
     feedAutomationSuspended = true;
     /* Existing comment-surface observers must become inert before Facebook's
        click handler starts swapping URLs and recycled dialog nodes. Without
@@ -508,13 +521,37 @@
     cancelPendingFeedAutomation();
   }
 
+  function suspendFeedAutomationForTrustedInteraction() {
+    contentFeed.restoreSuppressedFeedCards?.("trusted-feed-interaction");
+    feedAutomationSuspended = true;
+    cancelPendingFeedAutomation();
+    if (trustedFeedInteractionResumeTimer) {
+      clearTimeout(trustedFeedInteractionResumeTimer);
+    }
+
+    trustedFeedInteractionResumeTimer = setTimeout(() => {
+      trustedFeedInteractionResumeTimer = 0;
+      feedAutomationSuspended = false;
+      if (
+        runtimeReady &&
+        document.visibilityState === "visible" &&
+        window.location.pathname === "/" &&
+        !hasVisibleModalDialog()
+      ) {
+        scheduleSidebarSponsoredFiltering();
+        ensureHomeFeedObserver();
+        scheduleSponsoredFeedFiltering();
+      }
+    }, TRUSTED_FEED_INTERACTION_PAUSE_MS);
+  }
+
   function suspendCommentAutomationForDialogClose(dialog) {
     if (!(dialog instanceof Element)) {
       return false;
     }
 
     commentAutomationSuspended = true;
-    pendingSpaCommentUrl = "";
+    clearPendingSpaCommentWake();
     watchForDialogClose(dialog);
     return true;
   }
@@ -1179,6 +1216,16 @@
         source: "faceberg",
         kind: ANTI_REFRESH_CONFIG_KIND,
         enabled: settings.enableAntiRefresh === true
+      },
+      "*"
+    );
+    window.postMessage(
+      {
+        source: "faceberg",
+        kind: MAIN_FEED_SPONSORED_CONFIG_KIND,
+        enabled:
+          settings.enableFeedFilter === true &&
+          settings.enableBlockSponsoredPosts === true
       },
       "*"
     );
@@ -2098,6 +2145,10 @@
   }
 
   if (canUseExtensionApis()) {
+    document.addEventListener(MAIN_FEED_SPONSORED_SUPPRESSED_EVENT, () => {
+      queueStatIncrement("removedSponsored", 1);
+    }, true);
+
     document.addEventListener(ANTI_REFRESH_NAVIGATION_EVENT, (event) => {
       let detail = null;
       try {
@@ -2146,6 +2197,7 @@
 
       if (changes.enableFeedFilter) {
         settings.enableFeedFilter = changes.enableFeedFilter.newValue !== false;
+        requestTabProtection();
         if (settings.enableFeedFilter && settings.enableBlockSponsoredSidebar) {
           ensureSponsoredSidebarObserver();
         } else {
@@ -2172,6 +2224,7 @@
 
       if (changes.enableBlockSponsoredPosts) {
         settings.enableBlockSponsoredPosts = changes.enableBlockSponsoredPosts.newValue !== false;
+        requestTabProtection();
         shouldRerun = true;
       }
 
@@ -2360,6 +2413,7 @@
 
     const previousUrl = lastObservedUrl;
     lastObservedUrl = currentUrl;
+    contentFeed.restoreSuppressedFeedCards?.("spa-route-changed");
     runtimePerformance.spaUrlChanges += 1;
     const previousReelId = getReelRouteId(previousUrl);
     const currentReelId = getReelRouteId(currentUrl);
@@ -2378,10 +2432,9 @@
         : null;
     if (isPostOrMediaNavigationHref(currentUrl)) {
       commentAutomationSuspended = true;
-      pendingSpaCommentUrl = currentUrl;
-      tryCompletePendingSpaCommentWake();
+      armSpaCommentWake(currentUrl);
     } else {
-      pendingSpaCommentUrl = "";
+      clearPendingSpaCommentWake();
       const closingDialog = getVisiblePostDialog(document);
       if (!suspendCommentAutomationForDialogClose(closingDialog)) {
         commentAutomationSuspended = false;
@@ -2420,8 +2473,39 @@
       return false;
     }
 
-    pendingSpaCommentUrl = normalizedExpectedUrl;
+    if (pendingSpaCommentUrl !== normalizedExpectedUrl || !pendingSpaCommentReadyAt) {
+      pendingSpaCommentUrl = normalizedExpectedUrl;
+      pendingSpaCommentReadyAt = Date.now() + SPA_COMMENT_SURFACE_STABILIZE_MS;
+    }
+    schedulePendingSpaCommentWake();
     return tryCompletePendingSpaCommentWake();
+  }
+
+  function clearPendingSpaCommentWake() {
+    pendingSpaCommentUrl = "";
+    pendingSpaCommentReadyAt = 0;
+    if (pendingSpaCommentWakeTimer) {
+      clearTimeout(pendingSpaCommentWakeTimer);
+      pendingSpaCommentWakeTimer = 0;
+    }
+  }
+
+  function schedulePendingSpaCommentWake() {
+    if (!pendingSpaCommentUrl || pendingSpaCommentWakeTimer) {
+      return;
+    }
+
+    const expectedUrl = pendingSpaCommentUrl;
+    const delay = Math.max(0, pendingSpaCommentReadyAt - Date.now());
+    pendingSpaCommentWakeTimer = setTimeout(() => {
+      pendingSpaCommentWakeTimer = 0;
+      if (
+        pendingSpaCommentUrl === expectedUrl &&
+        window.location.href === expectedUrl
+      ) {
+        tryCompletePendingSpaCommentWake();
+      }
+    }, delay);
   }
 
   function tryCompletePendingSpaCommentWake() {
@@ -2430,13 +2514,18 @@
     }
 
     if (window.location.href !== pendingSpaCommentUrl) {
-      pendingSpaCommentUrl = "";
+      clearPendingSpaCommentWake();
+      return false;
+    }
+
+    if (Date.now() < pendingSpaCommentReadyAt) {
+      schedulePendingSpaCommentWake();
       return false;
     }
 
     const dialog = getVisiblePostDialog(document);
     if (dialog instanceof Element) {
-      pendingSpaCommentUrl = "";
+      clearPendingSpaCommentWake();
       feedAutomationSuspended = false;
       commentAutomationSuspended = false;
       debouncedRunAll(dialog);
@@ -2451,7 +2540,7 @@
       ? getActiveReelCommentSurface(document)
       : null;
     if (reelSurface instanceof Element) {
-      pendingSpaCommentUrl = "";
+      clearPendingSpaCommentWake();
       pendingReelSidebarRefresh = null;
       feedAutomationSuspended = false;
       commentAutomationSuspended = false;
@@ -2473,7 +2562,7 @@
       (isDirectPostPage() || isMediaViewerPage()) &&
       runCommentAutomation(document)
     ) {
-      pendingSpaCommentUrl = "";
+      clearPendingSpaCommentWake();
       feedAutomationSuspended = false;
       commentAutomationSuspended = false;
       expandPostBodies(getDirectPageExpansionRoot(document));
@@ -2583,7 +2672,7 @@
     if (shouldWakeCommentRuntimeFromClick(event)) {
       suspendFeedAutomationForNavigation();
     } else if (isTrustedFeedCardInteraction(event)) {
-      cancelPendingFeedAutomation();
+      suspendFeedAutomationForTrustedInteraction();
     }
   }, { capture: true, passive: true });
   window.addEventListener("pointerdown", noteUserScrollIntent, { capture: true, passive: true });

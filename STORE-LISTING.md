@@ -26,16 +26,15 @@ Main features:
 
 - Blocks Facebook-initiated automatic feed refreshes while leaving manual
   browser reloads available.
-- Hides verified Sponsored posts after binding each card to a stable post
-  identity. Faceberg scans all mounted cards below a viewport safety buffer and
-  handles stable first-screen ads only during bounded startup before input,
-  then restores a card immediately if Facebook recycles its feed unit. There
-  are no blank placeholders or scroll compensation. Faceberg also hides the
-  independent right-column module.
+- Hides verified Sponsored posts before layout by removing only normalized
+  Home-feed connection edges carrying Facebook's explicit `SponsoredData`
+  record. This creates no blank placeholder, rendered-card mutation, or scroll
+  compensation. Faceberg also hides the independent right-column module.
 - Removes Sponsored Reels using compact ad badges or known ad CTAs plus a
   verified external destination, while keeping native Reel navigation
   synchronized; also hides the Reels and Stories blocks.
-- Hides People You May Know, Follow, and Join suggestions.
+- Hides People You May Know. Follow and Join card cleanup is temporarily paused
+  to preserve Facebook's virtualized-card routing.
 - Expands truncated posts, comment text, and nested replies.
 - Switches supported discussions to All comments, with Reel automation bound to
   the currently viewed Reel rather than a recycled previous sidebar.

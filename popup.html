@@ -95,6 +95,11 @@
                   <span class="fb-toggle-label">Enable feed cleanup</span>
                 </label>
                 <p class="fb-dependent-note" id="feedCleanupNote">Turn on feed cleanup to configure filters.</p>
+                <p class="fb-dependent-note">
+                  Sponsored feed entries are filtered from Facebook's streamed
+                  data before React lays them out. Follow and Join card blocking
+                  remains paused for virtualized-renderer compatibility.
+                </p>
                 <div id="feedCleanupChildren">
                   <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter">
                     <input id="enableBlockSponsoredPosts" type="checkbox" />
@@ -130,15 +135,15 @@
                     <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
                     <span class="fb-toggle-label">Hide <strong>People You May Know</strong></span>
                   </label>
-                  <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter">
-                    <input id="enableBlockFollowPosts" type="checkbox" />
+                  <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter" data-compatibility-disabled="true">
+                    <input id="enableBlockFollowPosts" type="checkbox" disabled />
                     <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
-                    <span class="fb-toggle-label">Hide <strong>Follow</strong> posts</span>
+                    <span class="fb-toggle-label">Hide <strong>Follow</strong> posts (compatibility pause)</span>
                   </label>
-                  <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter">
-                    <input id="enableBlockJoinPosts" type="checkbox" />
+                  <label class="fb-toggle fb-toggle--indent" data-parent-toggle="enableFeedFilter" data-compatibility-disabled="true">
+                    <input id="enableBlockJoinPosts" type="checkbox" disabled />
                     <span class="fb-toggle-track"><span class="fb-toggle-thumb"></span></span>
-                    <span class="fb-toggle-label">Hide <strong>Join</strong> posts</span>
+                    <span class="fb-toggle-label">Hide <strong>Join</strong> posts (compatibility pause)</span>
                   </label>
                   <label
                     class="fb-toggle fb-toggle--indent"
@@ -233,15 +238,127 @@
                 <h3 class="fb-about-subtitle" id="whatsNewTitle">What's new</h3>
                 <span class="fb-release-badge" id="aboutVersion" aria-label="Current release version"></span>
               </div>
-              <p class="fb-release-date"><time datetime="2026-08-16">August 16, 2026</time></p>
+              <p class="fb-release-date"><time datetime="2026-09-04">September 4, 2026</time></p>
               <ul class="fb-changelog-list">
-                <li>Chrome feed ads are detected across all mounted cards below the viewport buffer.</li>
-                <li>Stable first-screen ads are handled only during bounded startup before interaction.</li>
+                <li>Keeps probing until Facebook's Home-feed connection handler is actually patched.</li>
+                <li>Catches Facebook when its module loader becomes available after Faceberg starts.</li>
               </ul>
 
               <details class="fb-release-history">
                 <summary>Previous releases</summary>
                 <div class="fb-release-history-body">
+                  <section class="fb-release-entry" aria-labelledby="release1231">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1231">v1.2.31</h4>
+                      <time datetime="2026-09-04">September 4, 2026</time>
+                    </div>
+                    <p>Added normalized connection filtering, but the loader probe could stop before that handler became accessible.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1230">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1230">v1.2.30</h4>
+                      <time datetime="2026-09-04">September 4, 2026</time>
+                    </div>
+                    <p>Wrapped the real payload listener, but live Vivaldi diagnostics proved all initial payloads had already been processed.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1229">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1229">v1.2.29</h4>
+                      <time datetime="2026-09-04">September 4, 2026</time>
+                    </div>
+                    <p>Reached Facebook's payload consumer, but its initial call occurred before later parser payloads existed.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1228">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1228">v1.2.28</h4>
+                      <time datetime="2026-09-04">September 4, 2026</time>
+                    </div>
+                    <p>Wrapped the exact payload consumer, but only when Facebook's lazy queue already existed before Faceberg started.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1227">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1227">v1.2.27</h4>
+                      <time datetime="2026-09-04">September 4, 2026</time>
+                    </div>
+                    <p>Tried to intercept Facebook's module-definition queue, but Vivaldi created that queue before the extension's MAIN-world script ran.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1226">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1226">v1.2.26</h4>
+                      <time datetime="2026-09-04">September 4, 2026</time>
+                    </div>
+                    <p>Tried to sanitize the initial JSON payload, but live Vivaldi evidence showed Facebook consumed it before the MutationObserver callback.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1225">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1225">v1.2.25</h4>
+                      <time datetime="2026-09-04">September 4, 2026</time>
+                    </div>
+                    <p>Patched Vivaldi's queued stream-cache factory, but live diagnostics proved the first bootstrap ad arrived before the API wrapper.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1224">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1224">v1.2.24</h4>
+                      <time datetime="2026-09-04">September 4, 2026</time>
+                    </div>
+                    <p>Guaranteed MAIN-world manifest injection and added live guard diagnostics, which exposed the missed bootstrap queue.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1223">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1223">v1.2.23</h4>
+                      <time datetime="2026-09-04">September 4, 2026</time>
+                    </div>
+                    <p>Introduced exact Relay edge filtering, but its dynamic MAIN-world registration did not intercept early enough in Vivaldi.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1222">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1222">v1.2.22</h4>
+                      <time datetime="2026-09-02">September 2, 2026</time>
+                    </div>
+                    <p>Stopped ordinary feed-card collapsing that exposed Facebook's off-screen SVG labels in Vivaldi.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1221">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1221">v1.2.21</h4>
+                      <time datetime="2026-08-24">August 24, 2026</time>
+                    </div>
+                    <p>Paused cleanup during delegated feed-card clicks and stabilized SPA post-dialog ownership.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1220">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1220">v1.2.20</h4>
+                      <time datetime="2026-08-24">August 24, 2026</time>
+                    </div>
+                    <p>Made unavailable overlays authoritative and added the first bounded feed-interaction pause.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1219">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1219">v1.2.19</h4>
+                      <time datetime="2026-08-20">August 20, 2026</time>
+                    </div>
+                    <p>Bound Reel reply expansion to the current narrow comment thread instead of the full page.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1218">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1218">v1.2.18</h4>
+                      <time datetime="2026-08-19">August 19, 2026</time>
+                    </div>
+                    <p>Added settled-scroll suppression for late-hydrated Vivaldi ads while protecting the viewport anchor.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1217">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1217">v1.2.17</h4>
+                      <time datetime="2026-08-18">August 18, 2026</time>
+                    </div>
+                    <p>Added bounded tolerance for Vivaldi's identity-less Sponsored-card hydration transition.</p>
+                  </section>
+                  <section class="fb-release-entry" aria-labelledby="release1216">
+                    <div class="fb-release-entry-heading">
+                      <h4 id="release1216">v1.2.16</h4>
+                      <time datetime="2026-08-16">August 16, 2026</time>
+                    </div>
+                    <p>Expanded Chrome ad coverage to all mounted cards below the safety buffer and bounded first-screen startup handling.</p>
+                  </section>
                   <section class="fb-release-entry" aria-labelledby="release1215">
                     <div class="fb-release-entry-heading">
                       <h4 id="release1215">v1.2.15</h4>

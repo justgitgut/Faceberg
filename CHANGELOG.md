@@ -1,5 +1,319 @@
 # Changelog
 
+## 2026-09-04 - v1.2.32
+
+### Fixed
+
+- Live Vivaldi generation-8 diagnostics showed five Sponsored payloads while
+  `data-faceberg-main-feed-connection-handler` remained `not-seen` and the
+  suppression count stayed zero. The brief ad-free observation after v1.2.31
+  was therefore transient, not proof that its connection boundary had run.
+- The loader probe incorrectly stopped as soon as the older stream and payload
+  fallbacks were both patched—even though live evidence had already disproved
+  them for Vivaldi's initial feed. Discovery now stops only after the connection
+  handler itself is patched.
+- Added a bounded accessor for Facebook's later `window.require` assignment. If
+  the connection module was registered before Faceberg started but `require`
+  becomes available afterward, Faceberg now patches it immediately. The
+  accessor and probes are released after success or a five-second bounded miss.
+
+### Acceptance
+
+- Generation 9 is not accepted merely because an ad is temporarily absent.
+  `data-faceberg-main-feed-connection-handler` must report `patched`, and the
+  suppression count must increase when Facebook serves an explicit ad.
+
+## 2026-09-04 - v1.2.31
+
+### Changed
+
+- Live Vivaldi generation-7 diagnostics disproved the v1.2.30 timing premise:
+  `requireLazy` and the payload listener were patched, but all 217 payload
+  scripts—including the explicit Sponsored edge—had already been processed and
+  the suppression count remained zero.
+- Faceberg now intercepts Facebook's named
+  `CometNewsFeedConnectionHandler` module and wraps its `update()` method. After
+  Facebook performs its native connection update, Faceberg removes only Relay
+  edges whose node has an explicit `th_dat_spo` or `sponsored_data` linked
+  record of type `SponsoredData`.
+- Filtering now occurs on the normalized Home-feed connection before Relay
+  publishes the update to feed layout. It does not return an empty story
+  component, collapse a rendered card, invoke a native Hide action, or alter
+  scroll geometry.
+
+### Diagnostics
+
+- Added `data-faceberg-main-feed-connection-handler`, reporting `not-seen`,
+  `factory-intercepted`, or `patched`. Generation 8 is accepted only when this
+  diagnostic reaches `patched` and the suppression count increases on a served
+  ad; package tests alone are not live Vivaldi acceptance.
+
+## 2026-09-04 - v1.2.30
+
+### Fixed
+
+- Live v1.2.29 diagnostics reached guard generation 6 with
+  `payloadConsumer=patched`, but the suppression count remained zero and all
+  197 Facebook `data-sjs` payload scripts were already marked processed. The
+  visible Kalua Softy and Curculia ads therefore proved the payload consumer's
+  initial `process()` call occurs before later parser payloads exist.
+- Live DOM inspection showed the Sponsored payload is immediately followed by
+  Facebook's executable direct
+  `requireLazy(["ServerJSPayloadListener"], m => m.process())` script. The guard
+  previously wrapped only calls stored in `__rl_stub`; once Facebook installed
+  the real `requireLazy`, those per-payload calls bypassed Faceberg. Faceberg
+  now intercepts assignment of the real function and wraps only callbacks that
+  request the named payload listener.
+- The earlier observer experiment also did not prove observers were too late:
+  its payload watcher was the loader probe itself and disconnected as soon as
+  the stream API was patched. A separate observer now remains active throughout
+  initial parsing as a bounded supplement to the synchronous consumer hook.
+
+### Safety and Diagnostics
+
+- The bounded observer examines only newly inserted inert
+  `application/json[data-sjs]` payloads containing the exact Home-feed module
+  and stream label. It refuses every script Facebook has already marked
+  `data-processed="1"`.
+- Added `data-faceberg-main-feed-payload-observer`, which reports `watching`,
+  `stopped`, or `unavailable`, plus
+  `data-faceberg-main-feed-require-lazy`, which reports whether the real
+  function was `wrapped`.
+  No rendered card, CSS geometry, scroll position, native Hide action, or
+  Facebook measurement node is changed.
+
+## 2026-09-04 - v1.2.29
+
+### Fixed
+
+- Live v1.2.28 diagnostics confirmed guard generation 5 was loaded, but it
+  stopped at `api-patched` with suppression count zero while the rendered
+  Mindvalley ad remained in Home-feed edge 1 with Facebook's explicit
+  `th_dat_spo: SponsoredData` marker.
+- Generation 5 covered a `__rl_stub` queue that already existed, but not the
+  normal `document_start` ordering where Faceberg runs first and Facebook
+  assigns that queue afterward. Faceberg now intercepts the queue assignment,
+  wraps its `push` method immediately, and catches the exact
+  `ServerJSPayloadListener` callback in either ordering.
+
+### Diagnostics and Safety
+
+- Added `data-faceberg-main-feed-payload-consumer`, reporting `not-seen`,
+  `queued`, or `patched`, so live acceptance no longer has to infer the payload
+  hook from the separate stream-API status.
+- The filter remains restricted to exact pre-render Home-feed commands carrying
+  explicit Sponsored data. It does not hide, resize, remove, or restyle a
+  rendered card and does not invoke Facebook's native Hide action.
+
+## 2026-09-04 - v1.2.28
+
+### Fixed
+
+- Live v1.2.27 diagnostics reported guard generation 4 and
+  `api-patched-direct`, but the visible ad remained and the suppression count
+  stayed at zero. That disproved the assumption that Vivaldi runs the extension
+  before Facebook creates its module-definition queue.
+- Facebook's initial Home-feed commands are instead consumed through the
+  queued `ServerJSPayloadListener.process()` callback. Faceberg now wraps that
+  exact `requireLazy` queue entry and removes only explicitly Sponsored
+  `RelayPrefetchedStreamCache.next` commands immediately before Facebook's
+  original payload processor runs.
+- Later organic edge indexes are compacted in document order, while the live
+  stream API remains wrapped for feed edges delivered after bootstrap.
+
+### Safety
+
+- The payload filter is no longer driven by a MutationObserver callback. It
+  scans inert `application/json` scripts only at Facebook's own payload-consumer
+  boundary and only parses scripts containing both the exact Home-feed module
+  and exact stream label.
+- No rendered post, React container, CSS geometry, placeholder, scroll
+  position, native Hide action, or Facebook measurement node is changed.
+
+## 2026-09-04 - v1.2.27
+
+### Fixed
+
+- Live v1.2.26 evidence disproved the MutationObserver bootstrap rewrite: the
+  E akademy ad remained in its `application/json` payload, the stream API was
+  patched only afterward, and the suppression count stayed at zero.
+- Faceberg now intercepts assignment of Facebook's `__d_stub` queue and wraps
+  only `RelayPrefetchedStreamCache` synchronously when its factory is pushed.
+  The stream API is therefore filtered before Facebook can consume the first
+  Home-feed edge in the same bootstrap turn.
+
+### Safety
+
+- Removed the ineffective large-JSON parsing and script-text rewriting from
+  v1.2.26. The new boundary changes one named module factory in Facebook's
+  temporary loader queue and restores the queue accessor once the API is
+  patched. Rendered cards, bootstrap payloads, and feed geometry remain native.
+- Added a root-level guard-generation diagnostic so a stale Facebook page can
+  be distinguished from the currently loaded extension after an update.
+
+## 2026-09-04 - v1.2.26
+
+### Fixed
+
+- Live v1.2.25 diagnostics reached `api-patched` but reported zero removals:
+  the first BetterMe ad had already arrived as Home-feed bootstrap edge 1 with
+  Facebook's explicit top-level `th_dat_spo: SponsoredData` marker.
+- The guard now removes that exact Sponsored edge from the matching inert
+  `RelayPrefetchedStreamCache.next` bootstrap command before Facebook processes
+  it, and compacts later organic edge indexes in the same stream.
+
+### Safety
+
+- Bootstrap filtering is restricted to `application/json` payloads containing
+  the exact Home-feed stream module and label. It does not inspect, hide,
+  collapse, restyle, or remove rendered feed cards, so it creates no card gap
+  or scroll compensation.
+
+## 2026-09-04 - v1.2.25
+
+### Fixed
+
+- Live v1.2.24 diagnostics proved the manifest script ran but remained at
+  `waiting-for-factory`: Facebook did not pass `RelayPrefetchedStreamCache`
+  through the replaceable global `window.__d` function in Vivaldi.
+- The guard now patches the exact `RelayPrefetchedStreamCache` factory inside
+  Facebook's early `__d_stub` bootstrap queue before the real module loader
+  consumes it. A bounded startup-only probe also patches an already-registered
+  export through `require` and stops as soon as `next` is wrapped.
+
+### Safety
+
+- The startup probe neither scans nor changes feed content. It watches only
+  long enough to locate the named module, then disconnects. Sponsored filtering
+  remains confined to explicit Home-feed Relay edges before React layout.
+
+## 2026-09-04 - v1.2.24
+
+### Fixed
+
+- Moved the Home-feed Sponsored stream interceptor into the manifest's
+  `document_start` MAIN-world script list. Live Vivaldi testing proved that the
+  v1.2.23 dynamically registered MAIN-world script loaded the extension but
+  missed Facebook's `RelayPrefetchedStreamCache` factory, so the ad edge still
+  reached React.
+- Recognizes both current explicit Facebook ad fields: non-null
+  `sponsored_data` and the top-level `th_dat_spo` `SponsoredData` object seen in
+  Vivaldi's live Home-feed payload.
+- Added a layout-neutral root diagnostic that reports whether the guard is
+  waiting for the factory, patched, or has actually suppressed an edge.
+
+### Safety
+
+- The replacement still rejects only the exact Home-feed Relay stream edge and
+  compacts subsequent indexes. It does not hide, collapse, remove, click, or
+  restyle a rendered Facebook card.
+
+## 2026-09-04 - v1.2.23
+
+### Fixed
+
+- Restored main-feed Sponsored blocking without touching rendered cards.
+  Faceberg now intercepts only Facebook's named `RelayPrefetchedStreamCache`
+  module and rejects a `CometNewsFeed_viewerConnection` stream edge only when
+  that edge's story contains explicit non-null `sponsored_data`.
+- Compacts later organic edge indexes by the number of earlier rejected ads so
+  Relay receives a dense feed sequence instead of a hole. Other Relay stream
+  labels, normal feed pagination, and organic stories pass through unchanged.
+- Re-enabled the Sponsored-feed toggle and records a removal only when the
+  pre-render stream guard actually rejects an ad.
+
+### Safety
+
+- The new path creates no DOM selector, CSS collapse, placeholder, native Hide
+  click, scroll compensation, or mutation of Facebook's off-screen SvgWml
+  measurement bucket. Follow and Join card cleanup remains paused.
+
+## 2026-09-02 - v1.2.22
+
+### Fixed
+
+- Retired persistent CSS collapsing for ordinary Sponsored, Follow, and Join
+  feed cards. Live Vivaldi inspection showed that collapsed cards expanded
+  Facebook's virtualizer render window until its body-level SvgWml text
+  measurement bucket grew past the `top: -10000px` offset and scattered
+  timestamps and `Learn More` labels across the visible page.
+- Restores every connected legacy suppression marker before feed cleanup runs,
+  including markers not owned by the current content-script instance.
+- Removed the settled-scroll suppression retry and added no selector, mask, or
+  mutation targeting Facebook's off-screen measurement bucket.
+
+### Compatibility
+
+- Main-feed Sponsored, Follow, and Join card blocking now fails open while
+  Facebook's current virtualized-card renderer cannot be filtered without page
+  corruption or recycled click targets. Independent sidebar Sponsored cleanup,
+  Sponsored Reel removal, Reels, Stories, and People You May Know cleanup remain
+  active.
+
+## 2026-08-24 - v1.2.21
+
+### Fixed
+
+- Prevented feed-card suppression from racing delegated Facebook clicks. Any
+  trusted pointer inside a Home-feed unit now pauses filtering, even when the
+  clicked image or text has no link/button semantics, and the suppression
+  primitive independently fails closed during that interaction window.
+- Delayed SPA comment automation until the replacement post dialog has been
+  stable for 1.2 seconds. A late unavailable/error state now cancels every
+  comment-root fallback and stale surface watcher before it can open sorting or
+  reply controls.
+
+### Diagnostics
+
+- Live Vivaldi evidence identified the exact failure: Faceberg suppressed the
+  Willem-Nieland-Design Follow card 101 ms before Facebook navigated to that
+  same post. Reloading the exact permalink rendered the valid post normally.
+
+## 2026-08-24 - v1.2.20
+
+### Fixed
+
+- Made Facebook's visible unavailable/error dialog authoritative. Faceberg now
+  fails closed instead of discarding that overlay and automating a stale post
+  dialog retained underneath it.
+- Paused layout-changing feed filtering for a short bounded window after any
+  trusted feed-card interaction, preventing Sponsored-card suppression or
+  restoration from racing Facebook's post navigation.
+
+## 2026-08-20 - v1.2.19
+
+### Fixed
+
+- Prevented Reel comment expansion from selecting Facebook's entire page as
+  the comment surface. Reply and comment-text controls must now belong to a
+  narrow current-Reel comment thread before Faceberg activates them, avoiding
+  recycled React handlers that could open the wrong or an unavailable post.
+
+## 2026-08-19 - v1.2.18
+
+### Fixed
+
+- Fixed Vivaldi ads whose identity and ad-only rendering metadata appear only
+  after the card has entered the viewport. Live inspection confirmed such a
+  card could retain a 344-character stable identity yet miss both pre-entry
+  and eight-second startup eligibility.
+- After scrolling is idle, Faceberg may now collapse a fully verified ad only
+  when its top edge remains below a stable viewport anchor strip. It leaves
+  partially passed cards untouched, creates no placeholder, and schedules one
+  settled follow-up instead of changing feed layout during active scrolling.
+
+## 2026-08-18 - v1.2.17
+
+### Fixed
+
+- Fixed Vivaldi feed ads reappearing immediately after Faceberg suppressed
+  them. Live diagnostics showed Facebook temporarily removing a card's stable
+  identity for 110-323 ms while hydrating the same Sponsored post.
+- Suppression now tolerates that identity-less transition for at most 750 ms,
+  while never transferring suppression to an unidentified card. A different
+  stable post identity still restores the feed unit immediately, preserving
+  the recycled-card and wrong-post safeguards from v1.2.15.
+
 ## 2026-08-16 - v1.2.16
 
 ### Fixed

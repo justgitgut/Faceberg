@@ -398,6 +398,21 @@
     );
   }
 
+  function hasExactCurrentRouteIdentityLink(surface) {
+    if (!(surface instanceof Element)) {
+      return false;
+    }
+
+    const currentIdentity = getPostRouteIdentity(window.location.href);
+    if (!currentIdentity) {
+      return false;
+    }
+
+    return [...surface.querySelectorAll('a[href]')].some(
+      (link) => getPostRouteIdentity(link.href) === currentIdentity
+    );
+  }
+
   function getViewportVisibilityScore(element) {
     if (!(element instanceof Element) || !isVisible(element)) {
       return 0;
@@ -614,10 +629,17 @@
     const scopeElement = reelContext;
     const seen = new Set();
     const candidates = [];
-    const selectors = '[role="complementary"], div[role="article"], [data-pagelet], main, [role="main"]';
+    const selectors = '[role="complementary"], div[role="article"], [data-pagelet]';
 
     function addCandidate(surface, bias = 0) {
-      if (!(surface instanceof Element) || seen.has(surface) || !isVisible(surface) || !hasCommentSurfaceSignals(surface)) {
+      if (
+        !(surface instanceof Element) ||
+        seen.has(surface) ||
+        !isVisible(surface) ||
+        surface.matches('main, [role="main"]') ||
+        hasVisibleLargeReelMedia(surface) ||
+        !hasCommentSurfaceSignals(surface)
+      ) {
         return;
       }
 
@@ -632,27 +654,22 @@
         return;
       }
 
-      if (!(reelContext.contains(surface) || surface.contains(reelContext) || surface.parentElement === reelContext.parentElement)) {
+      /* A parent that contains the Reel context also contains the video and any
+         recycled sidebars. It is a page container, not a comment owner. Only a
+         descendant of the current Reel context or a narrow sibling sidebar may
+         qualify. */
+      if (!(reelContext.contains(surface) || surface.parentElement === reelContext.parentElement)) {
         return;
       }
 
       seen.add(surface);
 
       let score = bias;
-      if (surface === reelContext) {
-        score += 60;
-      }
       if (surface.matches('[role="complementary"]')) {
         score += 95;
       }
-      if (surface.matches('main, [role="main"], [data-pagelet]')) {
+      if (surface.matches('[data-pagelet]')) {
         score += 50;
-      }
-      if (scopeElement instanceof Element && surface === scopeElement) {
-        score += 80;
-      }
-      if (scopeElement instanceof Element && surface.contains(scopeElement)) {
-        score += 35;
       }
       if (scopeElement instanceof Element && scopeElement.contains(surface)) {
         score += 20;
@@ -671,10 +688,6 @@
         score += 40;
       }
 
-      if (hasVisibleLargeReelMedia(surface)) {
-        score -= 15;
-      }
-
       const rect = surface.getBoundingClientRect();
       score += Math.min(120, getViewportVisibilityScore(surface));
 
@@ -688,7 +701,7 @@
     reelContext.querySelectorAll(selectors).forEach((surface) => addCandidate(surface, 20));
 
     if (reelContext.parentElement instanceof Element) {
-      reelContext.parentElement.querySelectorAll(':scope > [role="complementary"], :scope > div[role="article"], :scope > [data-pagelet], :scope > main, :scope > [role="main"]').forEach((surface) => addCandidate(surface, 25));
+      reelContext.parentElement.querySelectorAll(':scope > [role="complementary"], :scope > div[role="article"], :scope > [data-pagelet]').forEach((surface) => addCandidate(surface, 25));
     }
 
     return chooseBestScopedCandidate(candidates);
@@ -855,7 +868,7 @@
 
     const dialogs = [rootDialog, ...rootDialog.querySelectorAll('[role="dialog"]')]
       .filter((dialog, index, values) => {
-        return values.indexOf(dialog) === index && isRenderedCommentSurface(dialog) && !isIgnoredDialog(dialog);
+        return values.indexOf(dialog) === index && isRenderedCommentSurface(dialog);
       });
     if (dialogs.length === 0) {
       return null;
@@ -869,7 +882,7 @@
 
   function getDocumentTopRenderedDialog() {
     const visibleDialogs = [...document.querySelectorAll('[role="dialog"]')]
-      .filter((dialog) => isRenderedCommentSurface(dialog) && !isIgnoredDialog(dialog));
+      .filter((dialog) => isRenderedCommentSurface(dialog));
     const modalDialogs = visibleDialogs.filter((dialog) => dialog.getAttribute("aria-modal") === "true");
     return [...(modalDialogs.length > 0 ? modalDialogs : visibleDialogs)].reverse()[0] || null;
   }
@@ -912,7 +925,8 @@
       ? getCanonicalDialog(surface)
       : surface.closest('[role="dialog"]');
     if (canonicalDialog) {
-      return canonicalDialog === getDocumentTopRenderedDialog();
+      return !isIgnoredDialog(canonicalDialog) &&
+        canonicalDialog === getDocumentTopRenderedDialog();
     }
 
     if (isReelCommentSurface(surface)) {
@@ -975,6 +989,7 @@
        suppress normal feed handling; unrelated overlays otherwise hijack comment automation. */
     if (
       visibleDialog &&
+      !isIgnoredDialog(visibleDialog) &&
       surfaceMatchesCurrentPostRoute(visibleDialog) &&
       hasAutomatableDialogSignals(visibleDialog)
     ) {
@@ -2712,6 +2727,14 @@
   }
 
   function getActiveCommentAutomationRoot(root = document) {
+    const documentTopDialog = getDocumentTopRenderedDialog();
+    if (documentTopDialog && isIgnoredDialog(documentTopDialog)) {
+      debugCommentAutomation("resolve-root-blocked-by-error-dialog", {
+        resolved: describeElement(documentTopDialog)
+      });
+      return null;
+    }
+
     if (root instanceof Element) {
       const scopedDialog = getVisiblePostDialog(root);
       if (scopedDialog && hasAutomatableDialogSignals(scopedDialog)) {
@@ -3095,13 +3118,30 @@
       return matches;
     }
 
-    function isReplyControlInCommentThread(control) {
-      if (!(control instanceof Element)) {
+    function isRenderedCommentArticle(article) {
+      if (!(article instanceof Element) || !article.matches('div[role="article"]')) {
         return false;
       }
 
-      if (control.closest('[role="list"], [aria-live], ul, ol')) {
-        return true;
+      const articleLabel = normalizeText(article.getAttribute("aria-label"));
+      return (
+        articleLabel.startsWith("comment by ") ||
+        articleLabel.startsWith("reply by ") ||
+        (
+          !!article.querySelector('[role="button"][aria-label="Reply" i]') &&
+          !!article.querySelector('a[role="link"], [data-ad-rendering-role="profile_name"]')
+        )
+      );
+    }
+
+    function getOwningCommentArticle(control) {
+      if (!(control instanceof Element)) {
+        return null;
+      }
+
+      const closestArticle = control.closest('div[role="article"]');
+      if (closestArticle && activeDialog.contains(closestArticle) && isRenderedCommentArticle(closestArticle)) {
+        return closestArticle;
       }
 
       /*
@@ -3115,23 +3155,48 @@
         const commentArticles = [...wrapper.querySelectorAll('div[role="article"]')];
         if (commentArticles.length === 1) {
           const article = commentArticles[0];
-          const articleLabel = normalizeText(article.getAttribute("aria-label"));
-          const isRenderedComment =
-            articleLabel.startsWith("comment by ") ||
-            articleLabel.startsWith("reply by ") ||
-            (
-              !!article.querySelector('[role="button"][aria-label="Reply" i]') &&
-              !!article.querySelector('a[role="link"], [data-ad-rendering-role="profile_name"]')
-            );
-
-          if (isRenderedComment) {
-            return true;
+          if (isRenderedCommentArticle(article)) {
+            return article;
           }
         } else if (commentArticles.length > 1) {
           break;
         }
 
         wrapper = wrapper.parentElement;
+      }
+
+      return null;
+    }
+
+    function isReplyControlInCommentThread(control) {
+      return getOwningCommentArticle(control) instanceof Element;
+    }
+
+    function isControlOwnedByCurrentCommentSurface(control, controlKind) {
+      if (!(control instanceof Element) || !activeDialog.contains(control)) {
+        return false;
+      }
+
+      if (!isReelCommentSurface(activeDialog)) {
+        return true;
+      }
+
+      /* React can retain a role=button node while replacing a Reel. Its DOM has
+         no href, but its stale click handler can still navigate to the previous
+         post. On Reels, bind reply/text controls to a rendered comment article
+         that itself exposes the current route identity. */
+      if (["commentText", "replyLoadMore", "replySummary"].includes(controlKind)) {
+        const owningArticle = getOwningCommentArticle(control);
+        return !!owningArticle && hasExactCurrentRouteIdentityLink(owningArticle);
+      }
+
+      if (controlKind === "loadMore") {
+        const discussionRegion = control.closest('[role="list"], [aria-live], ul, ol');
+        return (
+          discussionRegion instanceof Element &&
+          activeDialog.contains(discussionRegion) &&
+          hasExactCurrentReelRouteLink(activeDialog)
+        );
       }
 
       return false;
@@ -3306,6 +3371,14 @@
       }
       if (!isLikelyCommentExpander(control)) {
         debugCommentAutomation("expander-skip-not-likely", { control: describeElement(control) });
+        continue;
+      }
+      if (!isControlOwnedByCurrentCommentSurface(control, controlKind)) {
+        debugCommentAutomation("expander-skip-unowned-control", {
+          target: describeElement(activeDialog),
+          control: describeElement(control),
+          controlKind
+        });
         continue;
       }
       if (

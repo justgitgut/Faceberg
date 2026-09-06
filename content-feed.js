@@ -34,6 +34,7 @@
   const COMPACT_HIDDEN_FEEDBACK_ATTRIBUTE = "data-faceberg-compact-hidden-feedback";
   const PENDING_NATIVE_HIDE_ATTRIBUTE = "data-faceberg-pending-native-hide";
   const SUPPRESSED_FEED_UNIT_ATTRIBUTE = "data-faceberg-suppressed-feed-unit";
+  const FEED_IDENTITY_GAP_GRACE_MS = 750;
   const HIDDEN_FEED_MODULE_ATTRIBUTE = "data-faceberg-hidden-feed-module";
   const HIDDEN_SPONSORED_REEL_ATTRIBUTE = "data-faceberg-hidden-sponsored-reel";
   const SPONSORED_REEL_CTA_LABELS = new Set([
@@ -525,6 +526,10 @@
     }
 
     suppression.observer?.disconnect();
+    if (suppression.identityGapTimer) {
+      clearTimeout(suppression.identityGapTimer);
+      suppression.identityGapTimer = 0;
+    }
     for (const contentRoot of suppression.contentRoots) {
       contentRoot.removeAttribute(SUPPRESSED_FEED_UNIT_ATTRIBUTE);
     }
@@ -539,6 +544,22 @@
     for (const unit of [...suppressedFeedUnits.keys()]) {
       restoreSuppressedFeedUnit(unit, reason);
     }
+
+    /*
+      Older content-script instances may have left a marker on a connected
+      root that is not represented in this runtime's map. Clear those markers
+      as well so upgrading into compatibility mode restores the page instead
+      of requiring Facebook to recycle every affected card first.
+    */
+    document
+      .querySelectorAll(`[${SUPPRESSED_FEED_UNIT_ATTRIBUTE}]`)
+      .forEach((contentRoot) => {
+        contentRoot.removeAttribute(SUPPRESSED_FEED_UNIT_ATTRIBUTE);
+      });
+  }
+
+  function restoreSuppressedFeedCards(reason = "feed-surface-inactive") {
+    restoreAllSuppressedFeedUnits(reason);
   }
 
   function reconcileSuppressedFeedUnits(deps = {}) {
@@ -556,12 +577,14 @@
         );
         const currentIdentity = getFeedPostIdentity(currentTarget);
         if (!currentIdentity) {
-          restoreSuppressedFeedUnit(unit, "identity-unavailable");
+          suppression.deferIdentityUnavailableRestore?.();
         } else if (
           suppression?.postIdentity &&
           currentIdentity !== suppression.postIdentity
         ) {
           restoreSuppressedFeedUnit(unit, "react-recycled");
+        } else {
+          suppression.clearIdentityGap?.();
         }
       }
     }
@@ -696,6 +719,16 @@
     { blockedLabel = "", statKey = "" } = {},
     deps = {}
   ) {
+    /* A trusted pointer may already be targeting this React-owned card even
+       when Facebook delegates the click from a plain div with no link/button
+       semantics. Never mutate feed geometry during that interaction window. */
+    if (
+      typeof deps.isFeedInteractionActive === "function" &&
+      deps.isFeedInteractionActive()
+    ) {
+      return false;
+    }
+
     const postIdentity = getFeedPostIdentity(target);
     const isSponsored = statKey === "removedSponsored";
     const hasMarker = isSponsored
@@ -731,6 +764,10 @@
 
     const suppression = {
       contentRoots: new Set(),
+      clearIdentityGap: null,
+      deferIdentityUnavailableRestore: null,
+      identityGapStartedAt: 0,
+      identityGapTimer: 0,
       observer: null,
       postIdentity,
       blockedLabel,
@@ -797,6 +834,85 @@
       return true;
     };
 
+    const clearIdentityGap = () => {
+      if (suppression.identityGapTimer) {
+        clearTimeout(suppression.identityGapTimer);
+        suppression.identityGapTimer = 0;
+      }
+      suppression.identityGapStartedAt = 0;
+    };
+
+    const resolveIdentityGap = () => {
+      suppression.identityGapTimer = 0;
+      if (suppressedFeedUnits.get(unit) !== suppression) {
+        return;
+      }
+
+      const settings = getRuntimeSettings(deps);
+      if (
+        !unit.isConnected ||
+        !isFeedSuppressionEnabled(suppression, settings)
+      ) {
+        restoreSuppressedFeedUnit(
+          unit,
+          unit.isConnected ? "setting-disabled" : "disconnected"
+        );
+        return;
+      }
+
+      const currentTarget = getCompletePostTargetWithin(
+        unit,
+        suppression.target
+      );
+      const currentIdentity = getFeedPostIdentity(currentTarget);
+      if (currentIdentity && currentIdentity !== suppression.postIdentity) {
+        restoreSuppressedFeedUnit(unit, "react-recycled");
+        return;
+      }
+      if (!currentIdentity) {
+        const elapsed = Date.now() - suppression.identityGapStartedAt;
+        if (elapsed < FEED_IDENTITY_GAP_GRACE_MS) {
+          suppression.identityGapTimer = setTimeout(
+            resolveIdentityGap,
+            FEED_IDENTITY_GAP_GRACE_MS - elapsed
+          );
+          return;
+        }
+        restoreSuppressedFeedUnit(unit, "identity-unavailable");
+        return;
+      }
+
+      clearIdentityGap();
+      if (!markCurrentRoot({ allowIdentityFallback: true })) {
+        restoreSuppressedFeedUnit(unit, "boundary-changed");
+        return;
+      }
+      debugFeedCleanup("feed-unit-identity-gap-recovered", {
+        statKey: suppression.statKey
+      });
+    };
+
+    const deferIdentityUnavailableRestore = () => {
+      if (!suppression.identityGapStartedAt) {
+        suppression.identityGapStartedAt = Date.now();
+        debugFeedCleanup("feed-unit-identity-gap-deferred", {
+          graceMs: FEED_IDENTITY_GAP_GRACE_MS,
+          statKey: suppression.statKey
+        });
+      }
+      if (!suppression.identityGapTimer) {
+        const elapsed = Date.now() - suppression.identityGapStartedAt;
+        suppression.identityGapTimer = setTimeout(
+          resolveIdentityGap,
+          Math.max(0, FEED_IDENTITY_GAP_GRACE_MS - elapsed)
+        );
+      }
+    };
+
+    suppression.clearIdentityGap = clearIdentityGap;
+    suppression.deferIdentityUnavailableRestore =
+      deferIdentityUnavailableRestore;
+
     const reconcile = () => {
       const settings = getRuntimeSettings(deps);
       if (
@@ -822,13 +938,14 @@
         );
         const currentIdentity = getFeedPostIdentity(currentTarget);
         if (!currentIdentity) {
-          restoreSuppressedFeedUnit(unit, "identity-unavailable");
+          deferIdentityUnavailableRestore();
           return;
         }
         if (currentIdentity !== suppression.postIdentity) {
           restoreSuppressedFeedUnit(unit, "react-recycled");
           return;
         }
+        clearIdentityGap();
         if (
           currentIdentity === suppression.postIdentity &&
           !markCurrentRoot({ allowIdentityFallback: true })
@@ -839,7 +956,21 @@
       }
 
       if (!markCurrentRoot()) {
-        restoreSuppressedFeedUnit(unit, "boundary-changed");
+        const currentTarget = getCompletePostTargetWithin(
+          unit,
+          suppression.target
+        );
+        const currentIdentity = getFeedPostIdentity(currentTarget);
+        if (!currentIdentity) {
+          deferIdentityUnavailableRestore();
+        } else if (currentIdentity !== suppression.postIdentity) {
+          restoreSuppressedFeedUnit(unit, "react-recycled");
+        } else {
+          clearIdentityGap();
+          restoreSuppressedFeedUnit(unit, "boundary-changed");
+        }
+      } else {
+        clearIdentityGap();
       }
     };
 
@@ -2224,6 +2355,34 @@
     );
   }
 
+  function isSettledVisibleSponsoredCandidate(element, deps = {}) {
+    if (
+      !(element instanceof Element) ||
+      document.visibilityState !== "visible" ||
+      typeof deps.isFeedScrollSettled !== "function" ||
+      !deps.isFeedScrollSettled()
+    ) {
+      return false;
+    }
+
+    /*
+      Some Vivaldi/Facebook combinations do not expose the ad-only rendering
+      bundle until a card has entered the viewport. Once scrolling is idle,
+      collapsing a card whose top edge is below this stable anchor strip does
+      not alter any content above the reader's position. Partially passed cards
+      remain untouched, which prevents the repeated upward-scroll rebound.
+    */
+    const rect = element.getBoundingClientRect();
+    const stableTop = Math.max(96, window.innerHeight * 0.1);
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      rect.top >= stableTop &&
+      rect.top < window.innerHeight &&
+      rect.bottom > stableTop
+    );
+  }
+
   function getSponsoredMarkers(container) {
     const explicitMarkers = getMatchingElements(
       container,
@@ -2520,7 +2679,17 @@
     document.querySelector("[data-faceberg-sponsored-mask-host]")?.remove();
 
     const settings = getRuntimeSettings(deps);
-    reconcileSuppressedFeedUnits(deps);
+
+    /*
+      Direct card suppression is intentionally retired in production. In
+      Vivaldi, collapsing verified inner roots keeps Facebook's virtualized
+      units mounted while allowing many more cards to enter the render window.
+      Facebook then accumulates default-sized SvgWml text-measurement nodes in
+      its body-level off-screen bucket until that bucket crosses back into the
+      viewport. Native Hide actions previously caused recycled click targets
+      and wrong-post navigation, so ordinary main-feed cards must fail open.
+    */
+    restoreAllSuppressedFeedUnits("react-feed-compatibility-mode");
     hideStoriesContainers(root, deps);
     hideReelsContainers(root, deps);
     hidePeopleYouMayKnow(root, deps);
@@ -2540,6 +2709,9 @@
 
     compactHiddenFeedbackWithin(root, deps);
     hideSidebarSponsored(root, deps);
+    if (!ENABLE_REACT_FEED_MUTATIONS) {
+      return;
+    }
     if (ENABLE_NATIVE_FEED_HIDE_ACTIONS) {
       hideBlockedLabelPostsNatively(root, deps);
     } else {
@@ -2561,6 +2733,7 @@
     let activatedTargetCount = 0;
     let activatedStartupVisibleCount = 0;
     let suppressedLateVisibleCount = 0;
+    let suppressedSettledVisibleCount = 0;
     const handledUnits = new Set();
 
     for (const container of mainContainers) {
@@ -2579,8 +2752,13 @@
         const isStartupVisibleCandidate =
           unit instanceof Element &&
           isStartupVisibleSponsoredCandidate(unit, deps);
+        const isSettledVisibleCandidate =
+          unit instanceof Element &&
+          isSettledVisibleSponsoredCandidate(unit, deps);
         const isEligibleCandidate =
-          isUpcomingCandidate || isStartupVisibleCandidate;
+          isUpcomingCandidate ||
+          isStartupVisibleCandidate ||
+          isSettledVisibleCandidate;
         if (
           !unit ||
           !isEligibleCandidate ||
@@ -2591,13 +2769,15 @@
 
         handledUnits.add(unit);
         if (!ENABLE_NATIVE_FEED_HIDE_ACTIONS) {
-          suppressedLateVisibleCount += Number(
-            suppressFeedUnitWithoutNativeHide(
+          const wasSuppressed = suppressFeedUnitWithoutNativeHide(
               unit,
               target,
               { statKey: "removedSponsored" },
               deps
-            )
+          );
+          suppressedLateVisibleCount += Number(wasSuppressed);
+          suppressedSettledVisibleCount += Number(
+            wasSuppressed && isSettledVisibleCandidate
           );
         } else if (activateNativeSponsoredHide(unit, target, deps)) {
           activatedTargetCount += 1;
@@ -2614,7 +2794,8 @@
         markerCount,
         activatedTargetCount,
         activatedStartupVisibleCount,
-        suppressedLateVisibleCount
+        suppressedLateVisibleCount,
+        suppressedSettledVisibleCount
       });
     }
   }
@@ -2633,6 +2814,7 @@
   }
 
   globalThis.FacebergFeedRuntime = Object.freeze({
+    restoreSuppressedFeedCards,
     runSidebarSponsoredFiltering,
     runSponsoredFeedFiltering,
     runSponsoredReelFiltering,

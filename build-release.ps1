@@ -29,6 +29,7 @@ $includePaths = @(
   "content-comments.js",
   "content.css",
   "content.js",
+  "main-feed-sponsored-guard.js",
   "injected.js",
   "module-guard-reset.js",
   "module-guard-enable-anti-refresh.js",

@@ -2,10 +2,12 @@
 
 ## Lightweight compatibility mode
 
-The current development build leaves React-owned Home-feed units and MAIN-world
-browser methods untouched. It installs no global subtree observer. A lightweight
-scroll-driven pass detects nearby Sponsored, Follow, and Join cards and
-suppresses only their verified direct inner roots. A trusted
+The current development build leaves ordinary React-owned Home-feed units and
+MAIN-world browser methods untouched. It installs no global subtree observer.
+Main-feed Sponsored stories are rejected at the exact Relay streamed-edge
+boundary before React lays them out. Follow and Join card blocking still fails
+open because no tested DOM or native-action boundary preserves Facebook's
+virtualizer and click routing. A trusted
 comment/post click schedules three bounded checks for a real dialog or supported
 direct post/media route; once found, the existing surface-local comment watcher
 handles that context.
@@ -24,7 +26,24 @@ Faceberg is scoped to four stable behaviors:
 ### Feed Cleanup
 
 - Runs against feed/main-content roots.
-- Destructive main-feed cleanup runs in fail-open compatibility mode because live testing showed that hiding or removing React-owned feed units can desynchronize click routing, stall infinite loading, and make native video controls unresponsive.
+- Destructive rendered-card cleanup runs in fail-open compatibility mode because live testing showed that hiding or removing React-owned feed units can desynchronize click routing, stall infinite loading, and make native video controls unresponsive.
+- Main-feed Sponsored cleanup uses the manifest-injected MAIN-world
+  `main-feed-sponsored-guard.js`. Generation-7 live evidence showed every
+  payload-level startup hook attached only after Facebook had processed the
+  initial payloads. The primary generation-8 boundary is therefore Facebook's
+  `CometNewsFeedConnectionHandler.update()` module. Faceberg lets the native
+  update complete, then filters the normalized connection's `edges` list before
+  Relay publishes subscriber updates. Qualification requires the edge's `node`
+  to expose a linked `th_dat_spo` or `sponsored_data` record whose concrete type
+  is exactly `SponsoredData`. Existing exact stream and payload interception is
+  retained only as a bounded fallback for later-delivered edges. No story
+  renderer returns `null`, and no rendered React node or geometry is changed.
+  Handler discovery remains active until that connection module is patched;
+  success of the older fallbacks cannot stop it. A temporary accessor also
+  catches Facebook assigning `window.require` after Faceberg starts, covering a
+  module registered before the extension's MAIN-world script but exposed to
+  `require` later. These loader hooks are released after handler success or a
+  bounded five-second miss.
 - Reels and Stories are the narrow exception to the ordinary-card rule: each is
   a verified standalone module. Faceberg applies a reversible CSS marker to the
   exact module root, keeps the React-owned node connected, and removes the
@@ -52,46 +71,43 @@ Faceberg is scoped to four stable behaviors:
   `Hide post`/`Hide ad` transition. Live failures showed that even Facebook's
   own replacement path can recycle a permalink handler onto a neighboring
   virtualized card.
-- Faceberg collapses only the verified direct inner root, keeps the outer
-  `[data-virtualized]`/`[aria-posinset]` unit connected, and uses a unit-scoped
-  observer plus post identity to restore the root before paint when React
-  recycles it for ordinary content.
+- Faceberg also does not collapse a verified direct inner root. Live Vivaldi
+  inspection showed that short collapsed cards expanded Facebook's virtualizer
+  render window, causing its default-sized body-level SvgWml measurement nodes
+  to grow beyond their `top: -10000px` bucket and enter the visible viewport.
+  Compatibility cleanup restores legacy suppression markers instead of masking
+  or modifying that Facebook-owned bucket.
 - The experimental compact-feedback setting may mark only the direct inner root of a confirmed `Ad hidden`/`Post hidden` payload. Confirmation requires one exact feedback heading, one exact `Undo` control, no post action menu or post footer, and one outer `[data-virtualized]`/`[aria-posinset]` boundary. A unit-scoped observer removes the mark before paint if React recycles the root for ordinary content.
 - Mutation and scroll events coalesce Sponsored detection into the next
   rendering frame. An already-suppressed unit is not handled twice, and the
   activity counter changes only after the verified inner root is marked.
-- Main-feed structural signals are scanned across every mounted card. Direct
-  suppression may act anywhere below one viewport plus a safety buffer after
-  resolving either an exact post-route identity or a long Facebook context
-  token; unlike native replacement, it has no two-viewport upper bound. A
-  generic post action label is never identity.
-- An identity-verified first-viewport Sponsored card is eligible only within
-  eight seconds of content-script startup and before any trusted pointer,
-  keyboard, wheel, or touch input. Visible suppression is otherwise forbidden.
-- The unit-scoped observer restores suppression immediately if the marker or
-  identity disappears or changes during React recycling. Ambiguous and
-  late-hydrated visible cards fail open.
-- Follow/Join suppression remains before-entry only. No main-feed path uses a
-  structural pre-paint selector, reserves visible height, inserts a placeholder,
-  invokes native Hide, or compensates the window scroll position.
+- Sponsored structural DOM signals remain isolated in the detector for
+  diagnostics, but the production DOM cleanup returns before any ordinary-card mutation path.
+  No main-feed path uses a structural pre-paint selector, reserves visible
+  height, inserts a placeholder, changes card geometry, invokes native Hide,
+  compensates scroll position, or targets Facebook's measurement bucket.
 - The exact `CometHomeRightSideEgo.react` renderer and
   `useSideAdsRefreshHandler` hook are replaced at document start while feed
   filtering is enabled. This prevents the independently rendered sidebar ad
   block and its visibility-return `CometHomeRightSideEgoRefetchQuery`.
 - Resolves the right-column Sponsored module from its heading, sponsored-content menu controls, outbound links, and media instead of depending on one generic button label.
 - Detects feed Sponsored labels even when Facebook splits, reorders, and pads the visible word with decoy DOM glyphs; rendered-label decoding is bounded to Facebook's compact `__cft__` metadata links.
-- Hides a Sponsored feed unit only after its action menu and footer controls establish the complete post boundary and exactly one native hide control is available.
+- Organic rendered cards and every card without explicit pre-render Sponsored
+  payload data remain native regardless of action-menu or footer evidence.
 - Re-removes an already-counted filtered module if React reconnects the same DOM node.
 - Resolves sidebar and recommendation modules from the smallest ancestor that satisfies their full signal set.
 - Refuses every removal target that contains the main region, composer, or Feed posts heading.
 - Non-post modules cannot remove any target containing a post action menu; Sponsored and Follow/Join detection require one complete card and refuse multi-post targets.
-- Follow/Join post filtering requires the card's unique native `Hide post by …`
-  control as structural evidence, but does not activate it. The verified direct
-  inner root is suppressed under the same identity-gated, before-entry contract
-  as Sponsored feed cards.
+- Follow/Join detection code may still use a unique native `Hide post by …`
+  control as structural evidence, but production cleanup returns before acting
+  on that evidence.
 - Does not open posts, dialogs, or menus.
-- Visual suppression cannot prevent a main-feed Sponsored card's initial shared
-  GraphQL payload or media request. The initial
+- Stream-edge suppression occurs after Facebook receives the shared GraphQL
+  response but before Relay delivers the explicit Sponsored story to React.
+  Initial commands are filtered before Facebook's payload observer consumes
+  them, and the module API remains wrapped for later calls, but the guard does
+  not claim to prevent
+  the network payload or media request. The initial
   `CometRightSideHeaderCardsQuery` is also shared with useful non-ad right-rail
   cards, so Faceberg leaves that request intact while preventing the separate
   ad renderer and later ad-only refetch. Selective blocking of shared feed

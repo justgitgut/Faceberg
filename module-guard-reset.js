@@ -3,6 +3,7 @@
 
   window.__facebergModuleGuardConfig = {
     antiRefresh: false,
-    feedFilter: false
+    feedFilter: false,
+    mainFeedSponsored: false
   };
 })();

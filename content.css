@@ -2,15 +2,14 @@
   Experimental hidden-feedback compaction.
 
   Facebook keeps ownership of the outer virtualized feed unit and all React
-  nodes remain connected. The pending marker collapses a post immediately
-  before Faceberg invokes Facebook's native Hide control; a MutationObserver
-  then converts it to the confirmed marker or restores it on failure. The
-  suppressed-feed-unit marker uses the same inner-root boundary without ever
-  invoking native Hide, so Facebook keeps its post-to-handler ownership.
+  nodes remain connected. The pending marker collapses a post only during the
+  disabled native Hide diagnostic path; the compact marker applies only after
+  exact hidden-feedback confirmation. Ordinary Sponsored/Follow/Join cards
+  deliberately have no CSS suppression: collapsing them makes Facebook mount
+  enough SvgWml measurement nodes to leak its off-screen bucket into Vivaldi.
 */
 
 [data-faceberg-pending-native-hide],
-[data-faceberg-suppressed-feed-unit],
 [data-faceberg-compact-hidden-feedback] {
   block-size: 1px !important;
   min-block-size: 0 !important;
@@ -31,8 +30,6 @@
 
 [data-faceberg-pending-native-hide],
 [data-faceberg-pending-native-hide] *,
-[data-faceberg-suppressed-feed-unit],
-[data-faceberg-suppressed-feed-unit] *,
 [data-faceberg-compact-hidden-feedback],
 [data-faceberg-compact-hidden-feedback] * {
   visibility: hidden !important;

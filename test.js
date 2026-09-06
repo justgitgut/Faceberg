@@ -39,6 +39,7 @@ impactItems.forEach(item => console.log(item.text));
 
 const fs = require("fs");
 const assert = require("assert");
+const vm = require("vm");
 const sourceFiles = Object.fromEntries(
   [
     "background.js",
@@ -49,7 +50,9 @@ const sourceFiles = Object.fromEntries(
     "popup.js",
     "popup.html",
     "manifest.json",
-    "shared-stats.js"
+    "shared-stats.js",
+    "main-feed-sponsored-guard.js",
+    "stale-feed-guard.js"
   ]
     .map((name) => [name, fs.readFileSync(name, "utf8")])
 );
@@ -227,14 +230,911 @@ assert.match(
   "content-feed.js: an active ad must advance through Facebook's native Next control"
 );
 assert.match(
+  sourceFiles["manifest.json"],
+  /"js"\s*:\s*\["main-feed-sponsored-guard\.js",\s*"injected\.js"\][\s\S]*?"run_at"\s*:\s*"document_start"[\s\S]*?"world"\s*:\s*"MAIN"/,
+  "manifest.json: Vivaldi-safe Sponsored stream filtering must start in Facebook's MAIN world"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /RelayPrefetchedStreamCache[\s\S]*?CometNewsFeed_viewerConnection\$stream\$CometNewsFeed_viewer_news_feed/,
+  "main-feed-sponsored-guard.js: missing the exact Home-feed stream boundary"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /CometNewsFeedConnectionHandler[\s\S]*?filterConnectionEdges[\s\S]*?replaceConnectionUpdate/,
+  "main-feed-sponsored-guard.js: missing the normalized Home-feed connection boundary"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /hasExplicitSponsoredData[\s\S]*?sponsored_data[\s\S]*?th_dat_spo[\s\S]*?rewriteStreamArgs/,
+  "main-feed-sponsored-guard.js: suppression must require Facebook's explicit sponsored payload data"
+);
+assert.match(
+  sourceFiles["content.js"],
+  /MAIN_FEED_SPONSORED_CONFIG_KIND[\s\S]*?settings\.enableFeedFilter === true[\s\S]*?settings\.enableBlockSponsoredPosts === true/,
+  "content.js: the manifest guard must still follow the user's Sponsored-post setting"
+);
+
+{
+  let registeredFactory = null;
+  const forwarded = [];
+  const events = [];
+  const diagnostics = {};
+  const context = {
+    CustomEvent: function CustomEvent(type) {
+      this.type = type;
+    },
+    document: {
+      documentElement: {
+        setAttribute(name, value) {
+          diagnostics[name] = value;
+        }
+      },
+      addEventListener() {},
+      dispatchEvent(event) {
+        events.push(event.type);
+      }
+    },
+    window: {
+      addEventListener() {},
+      clearTimeout() {},
+      setTimeout() {
+        return 1;
+      },
+      __d(moduleName, _dependencies, factory) {
+        if (moduleName === "RelayPrefetchedStreamCache") {
+          registeredFactory = factory;
+        }
+      }
+    }
+  };
+  vm.runInNewContext(sourceFiles["main-feed-sponsored-guard.js"], context);
+  context.window.__d(
+    "RelayPrefetchedStreamCache",
+    [],
+    function defineRelayPrefetchedStreamCache(
+      _global,
+      _require,
+      _requireDynamic,
+      _requireLazy,
+      _module,
+      _exports,
+      exportsObject
+    ) {
+      exportsObject.next = (...args) => forwarded.push(args);
+    }
+  );
+  assert.strictEqual(
+    typeof registeredFactory,
+    "function",
+    "module guard must replace the stream-cache factory"
+  );
+
+  const streamApi = {};
+  registeredFactory(null, null, null, null, null, null, streamApi);
+  const makePatch = (index, sponsored, label = "CometNewsFeed_viewerConnection$stream$CometNewsFeed_viewer_news_feed") => ({
+    __bbox: {
+      complete: false,
+      result: {
+        label,
+        path: ["viewer", "news_feed", "edges", index],
+        data: {
+          node: {
+            th_dat_spo: sponsored ? { __typename: "SponsoredData" } : null,
+            comet_sections: {
+              feedback: {
+                story: {
+                  sponsored_data: sponsored ? { __typename: "SponsoredData" } : null
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+
+  streamApi.next("home-stream", makePatch(1, true));
+  streamApi.next("home-stream", makePatch(2, false));
+  streamApi.next("other-stream", makePatch(7, true, "Unrelated_stream_label"));
+
+  assert.strictEqual(forwarded.length, 2, "the explicit Sponsored edge must not reach Relay");
+  assert.strictEqual(
+    forwarded[0][1].__bbox.result.path[3],
+    1,
+    "organic edges after a removed ad must be compacted to a dense index"
+  );
+  assert.strictEqual(
+    forwarded[1][1].__bbox.result.path[3],
+    7,
+    "unrelated Relay streams must remain untouched"
+  );
+  assert.deepStrictEqual(
+    events,
+    ["__facebergMainFeedSponsoredSuppressedV1"],
+    "each suppressed stream ad must emit one stats event"
+  );
+  assert.strictEqual(
+    context.window.__facebergMainFeedSponsoredGuardState.suppressedCount,
+    1,
+    "guard diagnostics must count only filtered Home-feed ads"
+  );
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-sponsored-guard"],
+    "suppressed",
+    "the live DOM diagnostic must expose successful stream suppression"
+  );
+}
+{
+  let registeredFactory = null;
+  let originalUpdateCalls = 0;
+  const diagnostics = {};
+  const events = [];
+  const context = {
+    CustomEvent: function CustomEvent(type) {
+      this.type = type;
+    },
+    document: {
+      documentElement: {
+        setAttribute(name, value) {
+          diagnostics[name] = value;
+        }
+      },
+      addEventListener() {},
+      dispatchEvent(event) {
+        events.push(event.type);
+      }
+    },
+    window: {
+      addEventListener() {},
+      clearTimeout() {},
+      setTimeout() {
+        return 1;
+      },
+      __d(moduleName, _dependencies, factory) {
+        if (moduleName === "CometNewsFeedConnectionHandler") {
+          registeredFactory = factory;
+        }
+      }
+    }
+  };
+  vm.runInNewContext(sourceFiles["main-feed-sponsored-guard.js"], context);
+  context.window.__d(
+    "CometNewsFeedConnectionHandler",
+    [],
+    function defineConnectionHandler(
+      _global,
+      _require,
+      _requireDynamic,
+      _requireLazy,
+      _module,
+      _exports,
+      exportsObject
+    ) {
+      exportsObject.update = () => {
+        originalUpdateCalls += 1;
+      };
+    }
+  );
+  assert.strictEqual(
+    typeof registeredFactory,
+    "function",
+    "module guard must replace the Home-feed connection-handler factory"
+  );
+
+  const makeNode = (sponsored) => ({
+    getLinkedRecord(field) {
+      if (field !== "th_dat_spo" || !sponsored) {
+        return null;
+      }
+      return {
+        getType() {
+          return "SponsoredData";
+        }
+      };
+    }
+  });
+  const organicEdge = {
+    getLinkedRecord(field) {
+      return field === "node" ? makeNode(false) : null;
+    }
+  };
+  const sponsoredEdge = {
+    getLinkedRecord(field) {
+      return field === "node" ? makeNode(true) : null;
+    }
+  };
+  const connection = {
+    edges: [organicEdge, sponsoredEdge],
+    getLinkedRecords(field) {
+      return field === "edges" ? this.edges : null;
+    },
+    setLinkedRecords(edges, field) {
+      if (field === "edges") {
+        this.edges = edges;
+      }
+    }
+  };
+  const parent = {
+    getLinkedRecord(field) {
+      return field === "home_handle" ? connection : null;
+    }
+  };
+  const store = {
+    get(dataID) {
+      return dataID === "client:root:viewer" ? parent : null;
+    }
+  };
+  const handler = {};
+  registeredFactory(null, null, null, null, null, null, handler);
+  handler.update(store, {
+    dataID: "client:root:viewer",
+    handleKey: "home_handle"
+  });
+
+  assert.strictEqual(originalUpdateCalls, 1, "the native connection update must run once");
+  assert.strictEqual(
+    connection.edges.length,
+    1,
+    "the Sponsored edge must be removed from Relay before feed layout consumes it"
+  );
+  assert.strictEqual(connection.edges[0], organicEdge);
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-connection-handler"],
+    "patched",
+    "live diagnostics must confirm the connection handler is patched"
+  );
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-sponsored-guard"],
+    "suppressed-at-connection",
+    "connection-level suppression must be visible in live diagnostics"
+  );
+  assert.deepStrictEqual(events, ["__facebergMainFeedSponsoredSuppressedV1"]);
+}
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /function interceptBootstrapDefineQueue[\s\S]*?STUB_PUSH_MARKER[\s\S]*?factory-intercepted-stub-push[\s\S]*?function installBootstrapQueueInterceptor[\s\S]*?Object\.defineProperty\(window, "__d_stub"/,
+  "main-feed-sponsored-guard.js: Vivaldi startup must synchronously intercept the stub queue before a MutationObserver checkpoint"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /function interceptRequireLazyQueue[\s\S]*?LAZY_STUB_PUSH_MARKER/,
+  "main-feed-sponsored-guard.js: the Facebook requireLazy bootstrap queue must be intercepted synchronously"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /function installRequireLazyQueueInterceptor[\s\S]*?Object\.defineProperty\(window, "__rl_stub"[\s\S]*?set\(nextQueue\)[\s\S]*?interceptRequireLazyQueue\(activeQueue\)/,
+  "main-feed-sponsored-guard.js: Facebook may assign its requireLazy queue after document_start"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /function wrapRequireLazy[\s\S]*?wrapPayloadListenerCallback[\s\S]*?function installRequireLazyInterceptor[\s\S]*?Object\.defineProperty\(window, "requireLazy"[\s\S]*?set\(nextRequireLazy\)/,
+  "main-feed-sponsored-guard.js: later direct requireLazy payload calls must not bypass the queued consumer hook"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /function installModuleRequireInterceptor[\s\S]*?Object\.defineProperty\(window, "require"[\s\S]*?set\(nextRequire\)[\s\S]*?patchExistingModule\(\)/,
+  "main-feed-sponsored-guard.js: Facebook's later module-require assignment must trigger a connection-handler patch"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /function maybeStopLoaderProbe\(\)\s*\{\s*if \(patchedConnectionHandler\)/,
+  "main-feed-sponsored-guard.js: disproven payload hooks must not stop connection-handler discovery"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /function replacePayloadProcess[\s\S]*?sanitizeExistingPayloadScripts\(\);[\s\S]*?originalProcess\.apply/,
+  "main-feed-sponsored-guard.js: the queued payload listener must sanitize exact commands synchronously before Facebook processes them"
+);
+assert.doesNotMatch(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /loaderProbeObserver\s*=\s*new MutationObserver\([\s\S]{0,160}sanitize(?:Payload|Existing)/,
+  "main-feed-sponsored-guard.js: payload rewriting must not share the loader probe that stops after API patching"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /function startPayloadObserver[\s\S]*?new MutationObserver\(\(records\)[\s\S]*?sanitizePayloadMutations\(records\)[\s\S]*?function replacePayloadProcess/,
+  "main-feed-sponsored-guard.js: a dedicated early observer must precede Facebook's long-lived payload listener"
+);
+assert.match(
+  sourceFiles["main-feed-sponsored-guard.js"],
+  /function sanitizePayloadScript[\s\S]*?getAttribute\?\.\("data-processed"\) === "1"[\s\S]*?function stopPayloadObserver/,
+  "main-feed-sponsored-guard.js: an already processed Facebook payload must never be rewritten"
+);
+{
+  const forwarded = [];
+  const context = {
+    CustomEvent: function CustomEvent(type) {
+      this.type = type;
+    },
+    MutationObserver: class MutationObserver {
+      constructor() {}
+      observe() {}
+      disconnect() {}
+    },
+    document: {
+      documentElement: {
+        setAttribute() {}
+      },
+      addEventListener() {},
+      dispatchEvent() {}
+    },
+    window: {
+      addEventListener() {},
+      clearTimeout() {},
+      setTimeout() {
+        return 1;
+      }
+    }
+  };
+  vm.runInNewContext(sourceFiles["main-feed-sponsored-guard.js"], context);
+  context.window.__d_stub = [];
+  const originalFactory = function originalFactory(
+    _global,
+    _require,
+    _requireDynamic,
+    _requireLazy,
+    _module,
+    _exports,
+    exportsObject
+  ) {
+    exportsObject.next = (...args) => forwarded.push(args);
+  };
+  context.window.__d_stub.push([
+    "RelayPrefetchedStreamCache",
+    [],
+    originalFactory,
+    98
+  ]);
+  const queuedFactory = context.window.__d_stub[0][2];
+  assert.notStrictEqual(
+    queuedFactory,
+    originalFactory,
+    "the bootstrap queue push must synchronously wrap the stream-cache factory"
+  );
+  const streamApi = {};
+  queuedFactory(null, null, null, null, null, null, streamApi);
+  streamApi.next("home-stream", {
+    __bbox: {
+      complete: false,
+      result: {
+        label: "CometNewsFeed_viewerConnection$stream$CometNewsFeed_viewer_news_feed",
+        path: ["viewer", "news_feed", "edges", 1],
+        data: {
+          node: {
+            th_dat_spo: { __typename: "SponsoredData" }
+          }
+        }
+      }
+    }
+  });
+  assert.strictEqual(
+    forwarded.length,
+    0,
+    "a Sponsored edge delivered through Facebook's queued Vivaldi bootstrap must be rejected"
+  );
+}
+
+{
+  const scripts = [];
+  let processCalls = 0;
+  const diagnostics = {};
+  const context = {
+    CustomEvent: function CustomEvent(type) {
+      this.type = type;
+    },
+    document: {
+      documentElement: {
+        setAttribute(name, value) {
+          diagnostics[name] = value;
+        }
+      },
+      addEventListener() {},
+      dispatchEvent() {},
+      querySelectorAll() {
+        return scripts;
+      }
+    },
+    window: {
+      addEventListener() {},
+      clearTimeout() {},
+      setTimeout() {
+        return 1;
+      }
+    }
+  };
+
+  vm.runInNewContext(sourceFiles["main-feed-sponsored-guard.js"], context);
+
+  context.window.__rl_stub = [];
+  context.window.requireLazy = function requireLazy() {
+    context.window.__rl_stub.push(arguments);
+  };
+  const originalCallback = (listener) => listener.process();
+  context.window.requireLazy(
+    ["ServerJSPayloadListener"],
+    originalCallback,
+    null,
+    0x100
+  );
+
+  assert.strictEqual(
+    context.window.__rl_stub.length,
+    1,
+    "Facebook's post-document_start queue assignment must remain functional"
+  );
+  const queuedCallback = context.window.__rl_stub[0][1];
+  assert.notStrictEqual(
+    queuedCallback,
+    originalCallback,
+    "a queue assigned after the guard starts must still wrap the payload consumer"
+  );
+  queuedCallback({
+    process() {
+      processCalls += 1;
+    }
+  });
+  assert.strictEqual(
+    processCalls,
+    1,
+    "the original Facebook payload processor must still run exactly once"
+  );
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-payload-consumer"],
+    "patched",
+    "live diagnostics must expose the post-assignment payload-consumer hook"
+  );
+}
+
+{
+  const diagnostics = {};
+  let processedCommands = null;
+  const payload = {
+    require: [
+      [
+        "ScheduledServerJS",
+        "handle",
+        null,
+        [
+          {
+            __bbox: {
+              require: [
+                [
+                  "RelayPrefetchedStreamCache",
+                  "next",
+                  [],
+                  [
+                    "home-stream",
+                    {
+                      __bbox: {
+                        complete: false,
+                        result: {
+                          label:
+                            "CometNewsFeed_viewerConnection$stream$CometNewsFeed_viewer_news_feed",
+                          path: ["viewer", "news_feed", "edges", 1],
+                          data: {
+                            node: {
+                              th_dat_spo: { __typename: "SponsoredData" }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              ]
+            }
+          }
+        ]
+      ]
+    ]
+  };
+  const script = {
+    nodeType: 1,
+    tagName: "SCRIPT",
+    textContent: JSON.stringify(payload),
+    getAttribute(name) {
+      if (name === "type") {
+        return "application/json";
+      }
+      return null;
+    }
+  };
+  const listener = {
+    process() {
+      processedCommands =
+        JSON.parse(script.textContent).require[0][3][0].__bbox.require;
+    }
+  };
+  const context = {
+    CustomEvent: function CustomEvent(type) {
+      this.type = type;
+    },
+    document: {
+      documentElement: {
+        setAttribute(name, value) {
+          diagnostics[name] = value;
+        }
+      },
+      addEventListener() {},
+      dispatchEvent() {},
+      querySelectorAll(selector) {
+        return selector === 'script[type="application/json"]' ? [script] : [];
+      }
+    },
+    window: {
+      addEventListener() {},
+      clearTimeout() {},
+      setTimeout() {
+        return 1;
+      }
+    }
+  };
+
+  vm.runInNewContext(sourceFiles["main-feed-sponsored-guard.js"], context);
+  const directRequireLazy = function directRequireLazy(_names, callback) {
+    return callback(listener);
+  };
+  context.window.requireLazy = directRequireLazy;
+  context.window.requireLazy(
+    ["ServerJSPayloadListener"],
+    (payloadListener) => payloadListener.process(),
+    null,
+    0x100
+  );
+
+  assert.strictEqual(
+    processedCommands.length,
+    0,
+    "a direct post-bootstrap requireLazy process call must sanitize the adjacent payload synchronously"
+  );
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-require-lazy"],
+    "wrapped",
+    "live diagnostics must expose interception of Facebook's real requireLazy function"
+  );
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-sponsored-count"],
+    "1",
+    "direct requireLazy suppression must increment the live count"
+  );
+}
+
+{
+  const diagnostics = {};
+  const connectionHandler = {
+    update() {}
+  };
+  const originalUpdate = connectionHandler.update;
+  const context = {
+    CustomEvent: function CustomEvent(type) {
+      this.type = type;
+    },
+    document: {
+      documentElement: {
+        setAttribute(name, value) {
+          diagnostics[name] = value;
+        }
+      },
+      addEventListener() {},
+      dispatchEvent() {}
+    },
+    window: {
+      addEventListener() {},
+      clearTimeout() {},
+      setTimeout() {
+        return 1;
+      }
+    }
+  };
+  vm.runInNewContext(sourceFiles["main-feed-sponsored-guard.js"], context);
+  context.window.require = function lateFacebookRequire(moduleName) {
+    if (moduleName === "CometNewsFeedConnectionHandler") {
+      return connectionHandler;
+    }
+    throw new Error(`Unknown module: ${moduleName}`);
+  };
+  assert.notStrictEqual(
+    connectionHandler.update,
+    originalUpdate,
+    "a handler exposed by Facebook's late require assignment must be patched immediately"
+  );
+  assert.strictEqual(
+    context.window.__facebergMainFeedSponsoredGuardState.patchedConnectionHandler,
+    true
+  );
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-connection-handler"],
+    "patched"
+  );
+}
+
+{
+  const streamLabel =
+    "CometNewsFeed_viewerConnection$stream$CometNewsFeed_viewer_news_feed";
+  const makeCommand = (index, sponsored) => [
+    "RelayPrefetchedStreamCache",
+    "next",
+    [],
+    [
+      "home-stream",
+      {
+        __bbox: {
+          complete: false,
+          result: {
+            label: streamLabel,
+            path: ["viewer", "news_feed", "edges", index],
+            data: {
+              node: {
+                th_dat_spo: sponsored
+                  ? { __typename: "SponsoredData" }
+                  : null
+              }
+            }
+          }
+        }
+      }
+    ]
+  ];
+  const makePayloadScript = (command) => ({
+    nodeType: 1,
+    tagName: "SCRIPT",
+    getAttribute(name) {
+      return name === "type" ? "application/json" : null;
+    },
+    textContent: JSON.stringify({
+      require: [
+        [
+          "ScheduledServerJS",
+          "handle",
+          null,
+          [{ __bbox: { require: [command] } }]
+        ]
+      ]
+    })
+  });
+  const scripts = [
+    makePayloadScript(makeCommand(1, true)),
+    makePayloadScript(makeCommand(2, false))
+  ];
+  let processedPayloads = null;
+  const events = [];
+  const diagnostics = {};
+  const context = {
+    CustomEvent: function CustomEvent(type) {
+      this.type = type;
+    },
+    document: {
+      documentElement: {
+        setAttribute(name, value) {
+          diagnostics[name] = value;
+        }
+      },
+      addEventListener() {},
+      dispatchEvent(event) {
+        events.push(event.type);
+      },
+      querySelectorAll(selector) {
+        return selector === 'script[type="application/json"]' ? scripts : [];
+      }
+    },
+    window: {
+      __rl_stub: [],
+      addEventListener() {},
+      clearTimeout() {},
+      setTimeout() {
+        return 1;
+      }
+    }
+  };
+  context.window.requireLazy = function requireLazy() {
+    context.window.__rl_stub.push(arguments);
+  };
+
+  vm.runInNewContext(sourceFiles["main-feed-sponsored-guard.js"], context);
+  const originalCallback = (listener) => listener.process();
+  context.window.requireLazy(
+    ["ServerJSPayloadListener"],
+    originalCallback,
+    null,
+    0x100
+  );
+  assert.strictEqual(
+    context.window.__rl_stub.length,
+    1,
+    "the Facebook requireLazy payload consumer must remain queued"
+  );
+  const queuedCallback = context.window.__rl_stub[0][1];
+  assert.notStrictEqual(
+    queuedCallback,
+    originalCallback,
+    "the queued ServerJSPayloadListener callback must be wrapped before bootstrap consumption"
+  );
+
+  const listener = {
+    process() {
+      processedPayloads = scripts.map((script) => JSON.parse(script.textContent));
+    }
+  };
+  queuedCallback(listener);
+
+  const firstCommands =
+    processedPayloads[0].require[0][3][0].__bbox.require;
+  const secondCommands =
+    processedPayloads[1].require[0][3][0].__bbox.require;
+  assert.strictEqual(
+    firstCommands.length,
+    0,
+    "the exact Sponsored Home-feed command must be removed before payload processing"
+  );
+  assert.strictEqual(
+    secondCommands[0][3][1].__bbox.result.path[3],
+    1,
+    "the later organic command must be compacted before payload processing"
+  );
+  assert.strictEqual(
+    context.window.__facebergMainFeedSponsoredGuardState.patchedPayloadListener,
+    true,
+    "guard diagnostics must confirm that the payload consumer was patched"
+  );
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-sponsored-guard"],
+    "suppressed",
+    "payload-level suppression must be visible in live diagnostics"
+  );
+  assert.deepStrictEqual(
+    events,
+    ["__facebergMainFeedSponsoredSuppressedV1"],
+    "the payload consumer boundary must emit one stats event per removed ad"
+  );
+}
+
+{
+  const observers = [];
+  const documentListeners = {};
+  const diagnostics = {};
+  const context = {
+    CustomEvent: function CustomEvent(type) {
+      this.type = type;
+    },
+    MutationObserver: class MutationObserver {
+      constructor(callback) {
+        this.callback = callback;
+        this.disconnected = false;
+        observers.push(this);
+      }
+      observe() {}
+      disconnect() {
+        this.disconnected = true;
+      }
+    },
+    document: {
+      documentElement: {
+        setAttribute(name, value) {
+          diagnostics[name] = value;
+        }
+      },
+      addEventListener(type, callback) {
+        documentListeners[type] = callback;
+      },
+      dispatchEvent() {},
+      querySelectorAll() {
+        return [];
+      }
+    },
+    window: {
+      addEventListener() {},
+      clearTimeout() {},
+      setTimeout() {
+        return 1;
+      }
+    }
+  };
+
+  vm.runInNewContext(sourceFiles["main-feed-sponsored-guard.js"], context);
+  assert.strictEqual(
+    observers.length,
+    2,
+    "the dedicated payload observer and loader probe must be separate"
+  );
+
+  const payload = {
+    require: [
+      [
+        "ScheduledServerJS",
+        "handle",
+        null,
+        [
+          {
+            __bbox: {
+              require: [
+                [
+                  "RelayPrefetchedStreamCache",
+                  "next",
+                  [],
+                  [
+                    "home-stream",
+                    {
+                      __bbox: {
+                        complete: false,
+                        result: {
+                          label:
+                            "CometNewsFeed_viewerConnection$stream$CometNewsFeed_viewer_news_feed",
+                          path: ["viewer", "news_feed", "edges", 1],
+                          data: {
+                            node: {
+                              th_dat_spo: { __typename: "SponsoredData" }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                ]
+              ]
+            }
+          }
+        ]
+      ]
+    ]
+  };
+  const script = {
+    nodeType: 1,
+    tagName: "SCRIPT",
+    textContent: JSON.stringify(payload),
+    getAttribute(name) {
+      if (name === "type") {
+        return "application/json";
+      }
+      return null;
+    }
+  };
+
+  observers[0].callback([
+    {
+      target: context.document,
+      addedNodes: [script]
+    }
+  ]);
+  const sanitized = JSON.parse(script.textContent);
+  assert.strictEqual(
+    sanitized.require[0][3][0].__bbox.require.length,
+    0,
+    "the earlier payload observer must remove the ad before Facebook's observer runs"
+  );
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-sponsored-count"],
+    "1",
+    "observer-boundary suppression must update live diagnostics"
+  );
+  assert.strictEqual(
+    observers[0].disconnected,
+    false,
+    "loader probing must not disconnect the dedicated payload observer"
+  );
+
+  documentListeners.DOMContentLoaded();
+  assert.strictEqual(
+    observers[0].disconnected,
+    true,
+    "the initial payload observer must disconnect after parser completion"
+  );
+  assert.strictEqual(
+    diagnostics["data-faceberg-main-feed-payload-observer"],
+    "stopped",
+    "live diagnostics must expose the bounded payload-observer lifecycle"
+  );
+}
+
+assert.match(
   sourceFiles["content-feed.js"],
   /if \(routeKey\) \{[\s\S]*?skipActiveSponsoredReel\(item, deps, routeKey\)[\s\S]*?continue;[\s\S]*?hideSponsoredReelItem/,
   "content-feed.js: the active scroll-snap item must never be layout-collapsed"
 );
 assert.match(
   sourceFiles["content-feed.js"],
-  /data-faceberg-suppressed-feed-unit/,
-  "content-feed.js: missing non-native feed-unit suppression"
+  /const ENABLE_REACT_FEED_MUTATIONS = false/,
+  "content-feed.js: ordinary React-owned feed-card mutations must fail open"
 );
 assert.match(
   sourceFiles["content-feed.js"],
@@ -243,18 +1143,28 @@ assert.match(
 );
 assert.match(
   sourceFiles["content-feed.js"],
-  /suppressFeedUnitWithoutNativeHide\([\s\S]*?SUPPRESSED_FEED_UNIT_ATTRIBUTE/,
-  "content-feed.js: filtered feed cards must use direct-root suppression"
+  /function restoreAllSuppressedFeedUnits[\s\S]*?querySelectorAll\(`\[\$\{SUPPRESSED_FEED_UNIT_ATTRIBUTE\}\]\`\)/,
+  "content-feed.js: compatibility mode must clear stale suppression markers"
 );
 assert.match(
   sourceFiles["content-feed.js"],
-  /function hideBlockedLabelPostsWithoutNativeHide\([\s\S]*?isSafeNativeHideCandidate\(unit\)[\s\S]*?\{ blockedLabel, statKey \}/,
-  "content-feed.js: Follow/Join suppression must remain before-entry only"
+  /function runSponsoredFeedFiltering[\s\S]*?restoreAllSuppressedFeedUnits\("react-feed-compatibility-mode"\)[\s\S]*?if \(!ENABLE_REACT_FEED_MUTATIONS\) \{\s*return;\s*\}[\s\S]*?hideBlockedLabelPostsWithoutNativeHide/,
+  "content-feed.js: main-feed filtering must restore legacy state and return before native or CSS suppression"
+);
+assert.match(
+  sourceFiles["content-feed.js"],
+  /function restoreSuppressedFeedCards[\s\S]*?restoreAllSuppressedFeedUnits\(reason\)[\s\S]*?Object\.freeze\(\{[\s\S]*?restoreSuppressedFeedCards/,
+  "content-feed.js: legacy-card restoration must be available to navigation guards"
+);
+assert.match(
+  sourceFiles["content.js"],
+  /function suspendFeedAutomationForNavigation[\s\S]*?restoreSuppressedFeedCards\?\.\("navigation-started"\)[\s\S]*?function suspendFeedAutomationForTrustedInteraction[\s\S]*?restoreSuppressedFeedCards\?\.\("trusted-feed-interaction"\)[\s\S]*?restoreSuppressedFeedCards\?\.\("spa-route-changed"\)/,
+  "content.js: clicks and SPA route changes must restore legacy card suppression immediately"
 );
 assert.match(
   sourceFiles["content-feed.js"],
   /function getSponsoredMarkers\([\s\S]*?const structuralMarkers =[\s\S]*?hasSponsoredStructuralMetadata\(target\)/,
-  "content-feed.js: Sponsored structural metadata must be scanned before viewport entry"
+  "content-feed.js: Sponsored structural detection must remain available for future safe integrations"
 );
 assert.doesNotMatch(
   sourceFiles["content-feed.js"],
@@ -268,33 +1178,18 @@ assert.doesNotMatch(
 );
 assert.doesNotMatch(
   sourceFiles["content.css"],
-  /data-faceberg-allow-sponsored-feed|html:not\([^)]*\) main[\s\S]*?data-ad-rendering-role/,
-  "content.css: main-feed cards must not bypass identity-gated suppression"
+  /data-faceberg-suppressed-feed-unit|data-faceberg-allow-sponsored-feed|html:not\([^)]*\) main[\s\S]*?data-ad-rendering-role/,
+  "content.css: ordinary main-feed cards must have no geometry-changing suppression rule"
 );
 assert.doesNotMatch(
   sourceFiles["content.js"],
   /ALLOW_SPONSORED_FEED_ATTRIBUTE|syncSponsoredFeedCssPolicy/,
   "content.js: unsafe pre-paint Sponsored policy must remain removed"
 );
-assert.match(
-  sourceFiles["content-feed.js"],
-  /function getFeedPostIdentity\([\s\S]*?return `route:\$\{routeIdentity\}`[\s\S]*?token\.length >= 32[\s\S]*?return cftToken \? `cft:/,
-  "content-feed.js: suppressed cards must require a stable route or cft identity"
-);
 assert.doesNotMatch(
   sourceFiles["content-feed.js"],
-  /const actionLabel =[\s\S]*?return actionLabel/,
-  "content-feed.js: generic action labels must never identify recycled posts"
-);
-assert.match(
-  sourceFiles["content-feed.js"],
-  /if \(!currentIdentity\) \{[\s\S]*?restoreSuppressedFeedUnit\(unit, "identity-unavailable"\)/,
-  "content-feed.js: identity loss must immediately restore a suppressed unit"
-);
-assert.match(
-  sourceFiles["content-feed.js"],
-  /currentIdentity !== suppression\.postIdentity[\s\S]*?return false;/,
-  "content-feed.js: a recycled post must not inherit the previous suppression root"
+  /querySelectorAll\([^)]*data-interactable|top:\s*-10000/,
+  "content-feed.js: the fix must not mask or mutate Facebook's off-screen measurement bucket"
 );
 assert.match(
   sourceFiles["content-feed.js"],
@@ -311,35 +1206,10 @@ assert.match(
   /hasSponsoredStructuralMetadata/,
   "content-feed.js: missing persistent Sponsored structural evidence"
 );
-assert.match(
-  sourceFiles["content-feed.js"],
-  /currentIdentity !== suppression\.postIdentity/,
-  "content-feed.js: missing identity-gated recycled-card restoration"
-);
 assert.doesNotMatch(
-  sourceFiles["content-feed.js"],
-  /isLateVisibleSponsoredCandidate/,
-  "content-feed.js: interaction-time visible-card suppression must remain disabled"
-);
-assert.match(
-  sourceFiles["content-feed.js"],
-  /function isSafeDirectSuppressionCandidate\([\s\S]*?rect\.top >= safeTop[\s\S]*?function isStartupVisibleSponsoredCandidate/,
-  "content-feed.js: direct suppression must scan all safely buffered mounted cards"
-);
-assert.match(
-  sourceFiles["content-feed.js"],
-  /function isStartupVisibleSponsoredCandidate\([\s\S]*?hasTrustedPageInteraction\(\)[\s\S]*?getRuntimeAgeMs\(\) > 8000/,
-  "content-feed.js: visible startup suppression must be time-bounded and canceled by trusted input"
-);
-assert.match(
-  sourceFiles["content-feed.js"],
-  /const isEligibleCandidate =\s*isUpcomingCandidate \|\| isStartupVisibleCandidate/,
-  "content-feed.js: stable first-viewport Sponsored cards must be eligible during startup"
-);
-assert.match(
   sourceFiles["content.js"],
-  /getRuntimeAgeMs: \(\) => Date\.now\(\) - runtimeCreatedAt/,
-  "content.js: feed filtering must expose a bounded startup age"
+  /FEED_SCROLL_SETTLE_MS|scheduleSettledSponsoredFeedFiltering|isFeedScrollSettled/,
+  "content.js: retired visible-card suppression must not retain delayed scroll passes"
 );
 assert.match(
   sourceFiles["content.js"],
@@ -355,6 +1225,36 @@ assert.match(
   sourceFiles["content-comments.js"],
   /canonicalScopedDialog === documentTopDialog/,
   "content-comments.js: a scoped stale dialog must not outrank the document's top dialog"
+);
+assert.match(
+  sourceFiles["content-comments.js"],
+  /function getDocumentTopRenderedDialog\(\)[\s\S]*?filter\(\(dialog\) => isRenderedCommentSurface\(dialog\)\)[\s\S]*?function getVisiblePostDialog[\s\S]*?!isIgnoredDialog\(visibleDialog\)/,
+  "content-comments.js: the top error dialog must block access to a stale post dialog underneath"
+);
+assert.match(
+  sourceFiles["content.js"],
+  /function suspendFeedAutomationForTrustedInteraction\(\)[\s\S]*?feedAutomationSuspended = true;[\s\S]*?TRUSTED_FEED_INTERACTION_PAUSE_MS[\s\S]*?isTrustedFeedCardInteraction\(event\)[\s\S]*?suspendFeedAutomationForTrustedInteraction\(\)/,
+  "content.js: trusted feed-card interactions must pause layout-changing filtering during navigation"
+);
+assert.match(
+  sourceFiles["content.js"],
+  /function isTrustedFeedCardInteraction\(event\)[\s\S]*?event\.target\.closest\([\s\S]*?\[data-virtualized\][\s\S]*?feedUnit\.closest\('\[role="main"\], main'\)/,
+  "content.js: delegated clicks on plain feed-card descendants must suspend filtering"
+);
+assert.match(
+  sourceFiles["content-feed.js"],
+  /function suppressFeedUnitWithoutNativeHide\([\s\S]*?deps\.isFeedInteractionActive\(\)[\s\S]*?return false;/,
+  "content-feed.js: direct suppression must fail closed during trusted feed interaction"
+);
+assert.match(
+  sourceFiles["content.js"],
+  /SPA_COMMENT_SURFACE_STABILIZE_MS = 1200[\s\S]*?pendingSpaCommentReadyAt = Date\.now\(\) \+ SPA_COMMENT_SURFACE_STABILIZE_MS[\s\S]*?Date\.now\(\) < pendingSpaCommentReadyAt/,
+  "content.js: SPA comment automation must wait for the replacement dialog to stabilize"
+);
+assert.match(
+  sourceFiles["content-comments.js"],
+  /resolve-root-blocked-by-error-dialog[\s\S]*?return null;/,
+  "content-comments.js: a rendered unavailable dialog must block every root fallback"
 );
 assert.match(
   sourceFiles["content-comments.js"],
@@ -396,6 +1296,21 @@ assert.match(
   /function getActiveReelCommentSurface\([\s\S]*?if \(!hasExactCurrentReelRouteLink\(surface\)\)[\s\S]*?return;/,
   "content-comments.js: the comment sidebar itself must identify the current Reel"
 );
+assert.match(
+  sourceFiles["content-comments.js"],
+  /function getActiveReelCommentSurface\([\s\S]*?const selectors = '\[role="complementary"\], div\[role="article"\], \[data-pagelet\]'[\s\S]*?surface\.matches\('main, \[role="main"\]'\)[\s\S]*?hasVisibleLargeReelMedia\(surface\)/,
+  "content-comments.js: a broad Reel main or video container must never own comment automation"
+);
+assert.match(
+  sourceFiles["content-comments.js"],
+  /function isControlOwnedByCurrentCommentSurface\([\s\S]*?isReelCommentSurface\(activeDialog\)[\s\S]*?getOwningCommentArticle\(control\)[\s\S]*?hasExactCurrentRouteIdentityLink\(owningArticle\)/,
+  "content-comments.js: Reel reply controls must belong to a current-route comment article"
+);
+assert.match(
+  sourceFiles["content-comments.js"],
+  /expander-skip-unowned-control/,
+  "content-comments.js: unowned recycled Reel controls must fail closed before activation"
+);
 assert.doesNotMatch(
   sourceFiles["content-comments.js"],
   /addCandidate\(reelContext/,
@@ -431,10 +1346,10 @@ assert.match(
   /\[data-faceberg-hidden-feed-module\]\s*\{[^}]*display:\s*none\s*!important/s,
   "content.css: missing standalone-module layout suppression"
 );
-assert.match(
+assert.doesNotMatch(
   sourceFiles["content.css"],
   /\[data-faceberg-suppressed-feed-unit\]/,
-  "content.css: missing non-native feed-unit layout suppression"
+  "content.css: retired main-feed suppression must not change card geometry"
 );
 assert.match(
   sourceFiles["content.css"],
@@ -453,13 +1368,23 @@ assert.match(
 );
 assert.strictEqual(
   JSON.parse(sourceFiles["manifest.json"].replace(/^\uFEFF/, "")).version,
-  "1.2.16",
-  "manifest.json: release version must be 1.2.16"
+  "1.2.32",
+  "manifest.json: release version must be 1.2.32"
 );
 assert.match(
   sourceFiles["popup.html"],
   /id="whatsNewTitle">What's new<\/h3>[\s\S]*?id="aboutVersion"[\s\S]*?class="fb-release-history"/,
   "popup.html: About tab must expose the current release and expandable history"
+);
+assert.match(
+  sourceFiles["popup.html"],
+  /id="enableBlockSponsoredPosts" type="checkbox"(?! disabled)[\s\S]*?data-compatibility-disabled="true"[\s\S]*?Follow[\s\S]*?data-compatibility-disabled="true"[\s\S]*?Join/,
+  "popup.html: Sponsored filtering must be enabled while Follow and Join stay compatibility-paused"
+);
+assert.match(
+  sourceFiles["popup.js"],
+  /data-compatibility-disabled[\s\S]*?input\.disabled = disabled/,
+  "popup.js: dependent-toggle synchronization must preserve compatibility-disabled controls"
 );
 assert.match(
   sourceFiles["popup.js"],

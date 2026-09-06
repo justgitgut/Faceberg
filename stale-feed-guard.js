@@ -16,13 +16,16 @@
     - CometHomeRightSideEgo.react
     - useSideAdsRefreshHandler
 
+    Main-feed Sponsored stream:
+    - RelayPrefetchedStreamCache
+
     The background worker registers this document-start interceptor with
     feature flags that mirror the user's settings. It replaces only the active
     group's exact module factories. Manual refresh, the normal feed query,
     pagination, routing, visibility, media playback, fetch, XMLHttpRequest, and
     Facebook's timer functions are deliberately left untouched.
   */
-  const GUARD_VERSION = 4;
+  const GUARD_VERSION = 5;
   const STATE_KEY = "__facebergStaleFeedGuardState";
   const DEFINE_MARKER = "__facebergStaleFeedDefineVersion";
   const FACTORY_MARKER = "__facebergStaleFeedFactoryVersion";
@@ -33,19 +36,34 @@
     "useCometNewsFeedRefreshThrottler",
     "useRefreshCometStoriesTrayOnMaintainedRouteUnmount"
   ]);
-  const FEED_FILTER_TARGET_MODULES = Object.freeze([
+  const SIDEBAR_FEED_FILTER_TARGET_MODULES = Object.freeze([
     "CometHomeRightSideEgo.react",
     "useSideAdsRefreshHandler"
   ]);
+  const MAIN_FEED_SPONSORED_TARGET_MODULES = Object.freeze([
+    "RelayPrefetchedStreamCache"
+  ]);
+  const MAIN_FEED_STREAM_MODULE = "RelayPrefetchedStreamCache";
+  const MAIN_FEED_STREAM_LABEL =
+    "CometNewsFeed_viewerConnection$stream$CometNewsFeed_viewer_news_feed";
+  const MAIN_FEED_SPONSORED_SUPPRESSED_EVENT =
+    "__facebergMainFeedSponsoredSuppressedV1";
   const moduleGuardConfig = Object.freeze({
     antiRefresh:
       window.__facebergModuleGuardConfig?.antiRefresh === true,
     feedFilter:
-      window.__facebergModuleGuardConfig?.feedFilter === true
+      window.__facebergModuleGuardConfig?.feedFilter === true,
+    mainFeedSponsored:
+      window.__facebergModuleGuardConfig?.mainFeedSponsored === true
   });
   const TARGET_MODULES = Object.freeze([
     ...(moduleGuardConfig.antiRefresh ? ANTI_REFRESH_TARGET_MODULES : []),
-    ...(moduleGuardConfig.feedFilter ? FEED_FILTER_TARGET_MODULES : [])
+    ...(moduleGuardConfig.feedFilter
+      ? SIDEBAR_FEED_FILTER_TARGET_MODULES
+      : []),
+    ...(moduleGuardConfig.mainFeedSponsored
+      ? MAIN_FEED_SPONSORED_TARGET_MODULES
+      : [])
   ]);
   const TARGET_MODULE_SET = new Set(TARGET_MODULES);
 
@@ -61,6 +79,8 @@
   const lateDetectedModules = [];
   const latePatchedModules = [];
   const errors = [];
+  const skippedMainFeedEdgeIndexes = new Map();
+  let suppressedMainFeedAds = 0;
   let loaderWrapped = false;
   let loaderMode = "not-found";
   let latePatchRequiresReload = false;
@@ -169,6 +189,195 @@
     return disabledFactory;
   }
 
+  function getMainFeedStreamPatch(args) {
+    const streamKey = args?.[0];
+    const envelope = args?.[1];
+    const bbox = envelope?.__bbox;
+    const result = bbox?.result;
+    const path = result?.path;
+    if (
+      typeof streamKey !== "string" ||
+      result?.label !== MAIN_FEED_STREAM_LABEL ||
+      !Array.isArray(path) ||
+      path.length !== 4 ||
+      path[0] !== "viewer" ||
+      path[1] !== "news_feed" ||
+      path[2] !== "edges" ||
+      !Number.isInteger(path[3]) ||
+      !result?.data?.node
+    ) {
+      return null;
+    }
+
+    return {
+      bbox,
+      edgeIndex: path[3],
+      envelope,
+      path,
+      result,
+      sequenceKey: `${streamKey}\u0000${MAIN_FEED_STREAM_LABEL}`,
+      streamKey
+    };
+  }
+
+  function hasExplicitSponsoredData(root) {
+    const pending = [{ depth: 0, value: root }];
+    let visited = 0;
+
+    while (pending.length > 0 && visited < 4000) {
+      const entry = pending.pop();
+      const value = entry?.value;
+      if (!value || typeof value !== "object") {
+        continue;
+      }
+      visited += 1;
+
+      if (
+        !Array.isArray(value) &&
+        Object.prototype.hasOwnProperty.call(value, "sponsored_data") &&
+        value.sponsored_data != null
+      ) {
+        return true;
+      }
+
+      if (entry.depth >= 12) {
+        continue;
+      }
+      if (Array.isArray(value)) {
+        for (let index = value.length - 1; index >= 0; index -= 1) {
+          pending.push({ depth: entry.depth + 1, value: value[index] });
+        }
+      } else {
+        for (const key of Object.keys(value)) {
+          pending.push({ depth: entry.depth + 1, value: value[key] });
+        }
+      }
+    }
+
+    return false;
+  }
+
+  function getSkippedEdgeIndexes(sequenceKey) {
+    let skipped = skippedMainFeedEdgeIndexes.get(sequenceKey);
+    if (!skipped) {
+      skipped = new Set();
+      skippedMainFeedEdgeIndexes.set(sequenceKey, skipped);
+    }
+    return skipped;
+  }
+
+  function rewriteMainFeedStreamArgs(args) {
+    const patch = getMainFeedStreamPatch(args);
+    if (!patch) {
+      return { args, skip: false };
+    }
+
+    const skipped = getSkippedEdgeIndexes(patch.sequenceKey);
+    if (hasExplicitSponsoredData(patch.result.data.node)) {
+      skipped.add(patch.edgeIndex);
+      suppressedMainFeedAds += 1;
+      document.dispatchEvent(
+        new CustomEvent(MAIN_FEED_SPONSORED_SUPPRESSED_EVENT)
+      );
+      return { args, skip: true };
+    }
+
+    let precedingSkippedCount = 0;
+    for (const skippedIndex of skipped) {
+      if (skippedIndex < patch.edgeIndex) {
+        precedingSkippedCount += 1;
+      }
+    }
+    if (precedingSkippedCount === 0) {
+      return { args, skip: false };
+    }
+
+    const nextArgs = Array.prototype.slice.call(args);
+    const nextPath = patch.path.slice();
+    nextPath[3] = patch.edgeIndex - precedingSkippedCount;
+    nextArgs[1] = {
+      ...patch.envelope,
+      __bbox: {
+        ...patch.bbox,
+        result: {
+          ...patch.result,
+          path: nextPath
+        }
+      }
+    };
+    return { args: nextArgs, skip: false };
+  }
+
+  function patchMainFeedStreamApi(candidate) {
+    const api =
+      candidate?.default && typeof candidate.default === "object"
+        ? candidate.default
+        : candidate;
+    const originalNext = api?.next;
+    if (
+      !api ||
+      (typeof api !== "object" && typeof api !== "function") ||
+      typeof originalNext !== "function" ||
+      Number(originalNext[FACTORY_MARKER] || 0) >= GUARD_VERSION
+    ) {
+      return false;
+    }
+
+    const filteredNext = function () {
+      const rewrite = rewriteMainFeedStreamArgs(arguments);
+      if (rewrite.skip) {
+        return undefined;
+      }
+      return originalNext.apply(this, rewrite.args);
+    };
+    Object.defineProperty(filteredNext, FACTORY_MARKER, {
+      value: GUARD_VERSION
+    });
+    try {
+      api.next = filteredNext;
+      if (api.next !== filteredNext) {
+        return false;
+      }
+    } catch (_error) {
+      return false;
+    }
+    addUnique(disabledModules, MAIN_FEED_STREAM_MODULE);
+    return true;
+  }
+
+  function patchMainFeedStreamFactoryExports(factoryArguments, factoryResult) {
+    if (patchMainFeedStreamApi(factoryResult)) {
+      return true;
+    }
+    for (let index = factoryArguments.length - 1; index >= 0; index -= 1) {
+      const candidate = factoryArguments[index];
+      if (patchMainFeedStreamApi(candidate)) {
+        return true;
+      }
+      if (patchMainFeedStreamApi(candidate?.exports)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function createMainFeedStreamFactory(factory) {
+    const wrappedFactory = function () {
+      const result = factory.apply(this, arguments);
+      if (!patchMainFeedStreamFactoryExports(arguments, result)) {
+        recordError(
+          MAIN_FEED_STREAM_MODULE,
+          "Facebook stream cache did not expose a writable next method."
+        );
+      }
+      return result;
+    };
+    Object.defineProperty(wrappedFactory, FACTORY_MARKER, {
+      value: GUARD_VERSION
+    });
+    return wrappedFactory;
+  }
+
   function replaceFactory(moduleName, factory) {
     if (
       !TARGET_MODULE_SET.has(moduleName) ||
@@ -179,6 +388,9 @@
     }
 
     addUnique(interceptedModules, moduleName);
+    if (moduleName === MAIN_FEED_STREAM_MODULE) {
+      return createMainFeedStreamFactory(factory);
+    }
     return createDisabledFactory(moduleName);
   }
 
@@ -236,7 +448,17 @@
       can change the active hook chain. Leave the live page untouched and let
       the document-start interceptor handle it on reload.
     */
-    if (FEED_FILTER_TARGET_MODULES.includes(moduleName)) {
+    if (SIDEBAR_FEED_FILTER_TARGET_MODULES.includes(moduleName)) {
+      return;
+    }
+
+    if (moduleName === MAIN_FEED_STREAM_MODULE) {
+      const patched =
+        patchMainFeedStreamApi(moduleRecord.exports) ||
+        patchMainFeedStreamApi(moduleRecord.defaultExport);
+      if (patched) {
+        addUnique(latePatchedModules, moduleName);
+      }
       return;
     }
 
@@ -381,6 +603,9 @@
     },
     get errors() {
       return errors.map((entry) => ({ ...entry }));
+    },
+    get suppressedMainFeedAds() {
+      return suppressedMainFeedAds;
     }
   });
 
